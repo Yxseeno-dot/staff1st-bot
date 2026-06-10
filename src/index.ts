@@ -4,7 +4,7 @@ import * as Ably from "ably";
 import { ChatClient, ChatMessageEventType } from "@ably/chat";
 import type { Room } from "@ably/chat";
 import { query, queryOne, execute } from "./db.js";
-import { processMessage } from "./openclaw.js";
+import { processMessage } from "./ai.js";
 
 const BOT_USER_ID = process.env.BOT_USER_ID!;
 const BOT_NAME = "Staff1st Bot";
