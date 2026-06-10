@@ -4,7 +4,7 @@ import * as Ably from "ably";
 import { ChatClient, ChatMessageEventType } from "@ably/chat";
 import type { Room } from "@ably/chat";
 import { query, queryOne, execute } from "./db.js";
-import { processMessage } from "./ai.js";
+import { processMessage, type BotReply } from "./ai.js";
 
 const BOT_USER_ID = process.env.BOT_USER_ID!;
 const BOT_NAME = "Staff1st Bot";
@@ -77,11 +77,11 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string, user
       console.log(`[${new Date().toISOString()}] [${roomName}] ${msg.clientId}: ${msg.text.slice(0, 100)}`);
 
       processMessage(conversationId, userId, msg.text)
-        .then(async (response) => {
-          await room.messages.send({ text: response });
+        .then(async (reply: BotReply) => {
+          await room.messages.send({ text: reply.text, ...(reply.metadata ? { metadata: reply.metadata } : {}) });
           await execute(
             `UPDATE locum1st.conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
-            [conversationId, `Bot: ${response.slice(0, 100)}`]
+            [conversationId, `Bot: ${reply.text.slice(0, 100)}`]
           );
           console.log(`[${new Date().toISOString()}] [${roomName}] Bot replied.`);
         })
