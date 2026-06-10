@@ -8,7 +8,9 @@ const BASE = process.env.BOT_API_BASE ?? "https://locum1st.y-hs.net/api/bot";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type BotMetadata = { [key: string]: string | number | boolean | null };
+// Recursive JSON-safe type compatible with Ably Chat's JsonObject
+type JsonVal = string | number | boolean | null | JsonVal[] | { [k: string]: JsonVal };
+export type BotMetadata = { [k: string]: JsonVal };
 
 export type BotReply = {
   text: string;
@@ -52,7 +54,9 @@ const states = new Map<string, State>();
 
 function plain(text: string): BotReply { return { text }; }
 function confirmShift(text: string): BotReply { return { text, metadata: { action: "confirm_shift" } }; }
-function selectDelete(text: string, count: number): BotReply { return { text, metadata: { action: "select_delete", count } }; }
+function selectDelete(text: string, shifts: Array<{ name: string; date: string }>): BotReply {
+  return { text, metadata: { action: "select_delete", shifts: shifts as unknown as JsonVal } };
+}
 
 async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -152,8 +156,17 @@ function verdictReason(rate: number, avgItems: number, shiftType: string): strin
 // ─── Date helpers ─────────────────────────────────────────────────────────────
 
 function fmtDate(d: string): string {
-  return new Date(d + "T12:00:00Z").toLocaleDateString("en-GB", {
+  // Normalise to YYYY-MM-DD — pg may return full ISO strings for DATE columns
+  const dateOnly = d.slice(0, 10);
+  return new Date(dateOnly + "T12:00:00Z").toLocaleDateString("en-GB", {
     weekday: "long", day: "numeric", month: "long", year: "numeric",
+  });
+}
+
+function fmtDateShort(d: string): string {
+  const dateOnly = d.slice(0, 10);
+  return new Date(dateOnly + "T12:00:00Z").toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", year: "numeric",
   });
 }
 
@@ -322,10 +335,11 @@ async function handleListShiftsForDelete(conversationId: string, userId: string)
   states.set(conversationId, { phase: "awaiting_delete", shifts: data.shifts });
 
   const list = data.shifts
-    .map((s, i) => `${i + 1}. ${s.pharmacy_name} — ${fmtDate(s.shift_date)}, ${s.start_time}–${s.end_time}`)
+    .map((s, i) => `${i + 1}. ${s.pharmacy_name} — ${fmtDateShort(s.shift_date)}, ${s.start_time}–${s.end_time}`)
     .join("\n");
 
-  return selectDelete(`Which shift do you want to cancel?\n\n${list}`, data.shifts.length);
+  const shiftMeta = data.shifts.map((s) => ({ name: s.pharmacy_name, date: fmtDateShort(s.shift_date) }));
+  return selectDelete(`Which shift do you want to cancel?\n\n${list}`, shiftMeta);
 }
 
 async function handleDeleteShift(conversationId: string, userId: string, shift: Shift): Promise<BotReply> {
@@ -344,7 +358,7 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
     shift.pharmacy_name,
     `${fmtDate(shift.shift_date)}, ${shift.start_time}–${shift.end_time}`,
     "",
-    "(The linked mileage log has been kept — remove it manually at locum1st.y-hs.net/mileage if needed.)",
+    "The linked mileage log has also been removed.",
   ].join("\n"));
 }
 
