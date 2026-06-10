@@ -170,13 +170,20 @@ async function handleShiftAnalysis(
   userId: string,
   ext: ShiftExtraction
 ): Promise<BotReply> {
-  const searchQuery = [ext.pharmacy_name, ext.pharmacy_postcode ?? ext.pharmacy_address]
-    .filter(Boolean).join(" ");
+  // Build the best possible search query from whatever pharmacy info is available
+  const searchQuery = [
+    ext.pharmacy_name,
+    ext.pharmacy_postcode,
+    ext.pharmacy_address,
+  ].filter(Boolean).join(" ").trim();
 
-  const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> }>(
-    `/pharmacy?q=${encodeURIComponent(searchQuery)}`
-  );
-  const match = pharmacyData.results?.[0];
+  let match: { odsCode: string; name: string; address: string } | undefined;
+  if (searchQuery) {
+    const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> }>(
+      `/pharmacy?q=${encodeURIComponent(searchQuery)}`
+    );
+    match = pharmacyData.results?.[0];
+  }
 
   type HistoryMonth = { items: number; pharmacyFirstTotal: number; nms: number; bpChecks: number };
   type HistoryData = { months?: HistoryMonth[] };
@@ -413,7 +420,6 @@ export async function processMessage(
   }
 
   const missing: string[] = [];
-  if (!ext.pharmacy_name) missing.push("Pharmacy name");
   if (!ext.shift_date) missing.push("Date");
   if (!ext.start_time) missing.push("Start time");
   if (!ext.end_time) missing.push("End time");
