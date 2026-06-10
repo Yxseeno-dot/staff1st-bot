@@ -28,19 +28,34 @@ async function ensureBotUser() {
     `SELECT auth_user_id FROM shared.user_profiles WHERE auth_user_id = $1`,
     [BOT_USER_ID]
   );
-  if (existing) return;
+  if (!existing) {
+    console.log(`[Staff1stBot] Registering bot user (${BOT_USER_ID})...`);
+    await execute(
+      `INSERT INTO shared.user_profiles (auth_user_id, email, full_name)
+       VALUES ($1, $2, $3) ON CONFLICT (auth_user_id) DO NOTHING`,
+      [BOT_USER_ID, "staff1st-bot@internal.locum1st", BOT_NAME]
+    );
+  }
 
-  console.log(`[Staff1stBot] Registering bot user (${BOT_USER_ID})...`);
-  await execute(
-    `INSERT INTO shared.user_profiles (auth_user_id, full_name) VALUES ($1, $2) ON CONFLICT (auth_user_id) DO NOTHING`,
-    [BOT_USER_ID, BOT_NAME]
-  );
-  await execute(
-    `INSERT INTO locum1st.profiles (auth_user_id, role_type, onboarding_completed_at)
-     VALUES ($1, 'bot', now()) ON CONFLICT (auth_user_id) DO NOTHING`,
+  // Ensure locum1st profile exists (needs user_profile_id FK)
+  const profileExists = await queryOne<{ auth_user_id: string }>(
+    `SELECT auth_user_id FROM locum1st.profiles WHERE auth_user_id = $1`,
     [BOT_USER_ID]
   );
-  console.log(`[Staff1stBot] Bot user registered.`);
+  if (!profileExists) {
+    const sharedProfile = await queryOne<{ id: number }>(
+      `SELECT id FROM shared.user_profiles WHERE auth_user_id = $1`,
+      [BOT_USER_ID]
+    );
+    if (sharedProfile) {
+      await execute(
+        `INSERT INTO locum1st.profiles (auth_user_id, user_profile_id, role_type, onboarding_completed_at)
+         VALUES ($1, $2, 'bot', now()) ON CONFLICT (auth_user_id) DO NOTHING`,
+        [BOT_USER_ID, sharedProfile.id]
+      );
+      console.log(`[Staff1stBot] Bot user registered.`);
+    }
+  }
 }
 
 async function attachToRoom(chatClient: ChatClient, conversationId: string) {
