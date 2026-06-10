@@ -58,7 +58,7 @@ async function ensureBotUser() {
   }
 }
 
-async function attachToRoom(chatClient: ChatClient, conversationId: string) {
+async function attachToRoom(chatClient: ChatClient, conversationId: string, userId: string) {
   if (activeRooms.has(conversationId)) return;
 
   const roomName = `convo-${conversationId}`;
@@ -76,7 +76,7 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string) {
       processingQueue.set(conversationId, true);
       console.log(`[${new Date().toISOString()}] [${roomName}] ${msg.clientId}: ${msg.text.slice(0, 100)}`);
 
-      processMessage(conversationId, msg.text)
+      processMessage(conversationId, userId, msg.text)
         .then(async (response) => {
           await room.messages.send({ text: response });
           await execute(
@@ -98,14 +98,17 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string) {
 
 async function pollConversations(chatClient: ChatClient) {
   try {
-    const rows = await query<{ id: string }>(
-      `SELECT id FROM locum1st.conversations WHERE participant_a = $1 OR participant_b = $1`,
+    const rows = await query<{ id: string; participant_a: string; participant_b: string }>(
+      `SELECT id, participant_a, participant_b FROM locum1st.conversations WHERE participant_a = $1 OR participant_b = $1`,
       [BOT_USER_ID]
     );
     const newRooms = rows.filter((r) => !activeRooms.has(r.id));
     if (newRooms.length > 0) {
       console.log(`[${new Date().toISOString()}] Found ${newRooms.length} new conversation(s).`);
-      await Promise.all(newRooms.map((r) => attachToRoom(chatClient, r.id)));
+      await Promise.all(newRooms.map((r) => {
+        const userId = r.participant_a === BOT_USER_ID ? r.participant_b : r.participant_a;
+        return attachToRoom(chatClient, r.id, userId);
+      }));
     }
   } catch (err) {
     console.error("Poll error:", err);
