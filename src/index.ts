@@ -1,15 +1,18 @@
 import "dotenv/config";
+import http from "http";
 import * as Ably from "ably";
 import { ChatClient, ChatMessageEventType } from "@ably/chat";
 import type { Room } from "@ably/chat";
-import { query, execute } from "./db.js";
+import { query, queryOne, execute } from "./db.js";
 import { processMessage } from "./openclaw.js";
 
-const BOT_USER_ID = process.env.BOT_USER_ID;
+const BOT_USER_ID = process.env.BOT_USER_ID!;
+const BOT_NAME = "Staff1st Bot";
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS ?? "30000", 10);
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 if (!BOT_USER_ID) {
-  console.error("BOT_USER_ID is required. Run `npm run setup` first.");
+  console.error("BOT_USER_ID is required.");
   process.exit(1);
 }
 if (!process.env.ABLY_API_KEY) {
@@ -18,7 +21,27 @@ if (!process.env.ABLY_API_KEY) {
 }
 
 const activeRooms = new Map<string, Room>();
-const processingQueue = new Map<string, boolean>(); // debounce per conversation
+const processingQueue = new Map<string, boolean>();
+
+async function ensureBotUser() {
+  const existing = await queryOne<{ auth_user_id: string }>(
+    `SELECT auth_user_id FROM shared.user_profiles WHERE auth_user_id = $1`,
+    [BOT_USER_ID]
+  );
+  if (existing) return;
+
+  console.log(`[Staff1stBot] Registering bot user (${BOT_USER_ID})...`);
+  await execute(
+    `INSERT INTO shared.user_profiles (auth_user_id, full_name) VALUES ($1, $2) ON CONFLICT (auth_user_id) DO NOTHING`,
+    [BOT_USER_ID, BOT_NAME]
+  );
+  await execute(
+    `INSERT INTO locum1st.profiles (auth_user_id, role_type, onboarding_completed_at)
+     VALUES ($1, 'bot', now()) ON CONFLICT (auth_user_id) DO NOTHING`,
+    [BOT_USER_ID]
+  );
+  console.log(`[Staff1stBot] Bot user registered.`);
+}
 
 async function attachToRoom(chatClient: ChatClient, conversationId: string) {
   if (activeRooms.has(conversationId)) return;
@@ -33,30 +56,22 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string) {
       if (event.type !== ChatMessageEventType.Created) return;
       const msg = event.message;
       if (msg.clientId === BOT_USER_ID) return;
-
-      // Skip if already processing a message for this conversation
       if (processingQueue.get(conversationId)) return;
-      processingQueue.set(conversationId, true);
 
+      processingQueue.set(conversationId, true);
       console.log(`[${new Date().toISOString()}] [${roomName}] ${msg.clientId}: ${msg.text.slice(0, 100)}`);
 
       processMessage(conversationId, msg.text)
         .then(async (response) => {
           await room.messages.send({ text: response });
           await execute(
-            `UPDATE locum1st.conversations
-             SET last_message_at = now(), last_message_preview = $2
-             WHERE id = $1`,
+            `UPDATE locum1st.conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
             [conversationId, `Bot: ${response.slice(0, 100)}`]
           );
           console.log(`[${new Date().toISOString()}] [${roomName}] Bot replied.`);
         })
-        .catch((err) => {
-          console.error(`[${roomName}] Error processing message:`, err);
-        })
-        .finally(() => {
-          processingQueue.delete(conversationId);
-        });
+        .catch((err) => console.error(`[${roomName}] Error:`, err))
+        .finally(() => processingQueue.delete(conversationId));
     });
 
     activeRooms.set(conversationId, room);
@@ -72,7 +87,6 @@ async function pollConversations(chatClient: ChatClient) {
       `SELECT id FROM locum1st.conversations WHERE participant_a = $1 OR participant_b = $1`,
       [BOT_USER_ID]
     );
-
     const newRooms = rows.filter((r) => !activeRooms.has(r.id));
     if (newRooms.length > 0) {
       console.log(`[${new Date().toISOString()}] Found ${newRooms.length} new conversation(s).`);
@@ -83,26 +97,38 @@ async function pollConversations(chatClient: ChatClient) {
   }
 }
 
+function startHealthServer() {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", rooms: activeRooms.size }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  server.listen(PORT, () => console.log(`[Staff1stBot] Health server on :${PORT}`));
+}
+
 async function main() {
+  await ensureBotUser();
+
   const realtime = new Ably.Realtime({
     key: process.env.ABLY_API_KEY!,
     clientId: BOT_USER_ID,
   });
-
   const chatClient = new ChatClient(realtime);
 
   console.log(`[Staff1stBot] Starting — clientId: ${BOT_USER_ID}`);
 
+  startHealthServer();
   await pollConversations(chatClient);
   setInterval(() => pollConversations(chatClient), POLL_INTERVAL);
 
-  console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s for new conversations.`);
+  console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s.`);
 
-  process.on("SIGINT", async () => {
-    console.log("\n[Staff1stBot] Shutting down...");
-    realtime.close();
-    process.exit(0);
-  });
+  process.on("SIGTERM", () => { realtime.close(); process.exit(0); });
+  process.on("SIGINT", () => { realtime.close(); process.exit(0); });
 }
 
 main().catch((err) => {
