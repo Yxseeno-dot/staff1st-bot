@@ -324,7 +324,7 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
 
 async function handleListShiftsForDelete(conversationId: string, userId: string): Promise<string> {
   const data = await botFetch<{ shifts?: Shift[]; error?: string }>(
-    `/shifts?auth_user_id=${encodeURIComponent(userId)}`
+    `/shifts?auth_user_id=${encodeURIComponent(userId)}&upcoming=true`
   );
 
   if (!data.shifts?.length) {
@@ -337,7 +337,7 @@ async function handleListShiftsForDelete(conversationId: string, userId: string)
     .map((s, i) => `${i + 1}. ${s.pharmacy_name} — ${fmtDate(s.shift_date)}, ${s.start_time}–${s.end_time}`)
     .join("\n");
 
-  return `Which shift was cancelled?\n\n${list}\n\nReply with the number.`;
+  return `Which shift do you want to cancel?\n\n${list}\n\nReply with the number.`;
 }
 
 async function handleDeleteShift(conversationId: string, userId: string, shift: Shift): Promise<string> {
@@ -407,8 +407,13 @@ export async function processMessage(
     return "Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.y-hs.net/upgrade to use the bot.";
   }
 
-  // ── Delete request ────────────────────────────────────────────────────────
-  if (/\b(cancel|delete|remove)\b.*\bshift\b|\bshift\b.*\b(cancel|delete|remove)\b/i.test(trimmed)) {
+  // ── Cancel / delete shift ─────────────────────────────────────────────────
+  // Catches: "cancel my shift", "my shift was cancelled", "delete a shift",
+  //          "shift got cancelled", "remove shift", "cancel the Boots shift"
+  if (
+    /\b(cancel|cancelled|cancelling|delete|deleted|remove|removed)\b/i.test(trimmed) &&
+    /\bshift\b/i.test(trimmed)
+  ) {
     return handleListShiftsForDelete(conversationId, userId);
   }
 
