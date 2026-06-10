@@ -1,0 +1,23 @@
+{
+  "name": "staff1st-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "setup": "tsx src/setup.ts"
+  },
+  "dependencies": {
+    "@ably/chat": "^1.4.0",
+    "ably": "^2.22.1",
+    "dotenv": "^16.4.7",
+    "pg": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8",
+    "tsx": "^4.19.4",
+    "typescript": "^5"
+  }
+}

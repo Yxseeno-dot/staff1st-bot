@@ -1,0 +1,111 @@
+import "dotenv/config";
+import * as Ably from "ably";
+import { ChatClient, ChatMessageEventType } from "@ably/chat";
+import type { Room } from "@ably/chat";
+import { query, execute } from "./db.js";
+import { processMessage } from "./openclaw.js";
+
+const BOT_USER_ID = process.env.BOT_USER_ID;
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS ?? "30000", 10);
+
+if (!BOT_USER_ID) {
+  console.error("BOT_USER_ID is required. Run `npm run setup` first.");
+  process.exit(1);
+}
+if (!process.env.ABLY_API_KEY) {
+  console.error("ABLY_API_KEY is required.");
+  process.exit(1);
+}
+
+const activeRooms = new Map<string, Room>();
+const processingQueue = new Map<string, boolean>(); // debounce per conversation
+
+async function attachToRoom(chatClient: ChatClient, conversationId: string) {
+  if (activeRooms.has(conversationId)) return;
+
+  const roomName = `convo-${conversationId}`;
+
+  try {
+    const room = await chatClient.rooms.get(roomName);
+    await room.attach();
+
+    room.messages.subscribe((event) => {
+      if (event.type !== ChatMessageEventType.Created) return;
+      const msg = event.message;
+      if (msg.clientId === BOT_USER_ID) return;
+
+      // Skip if already processing a message for this conversation
+      if (processingQueue.get(conversationId)) return;
+      processingQueue.set(conversationId, true);
+
+      console.log(`[${new Date().toISOString()}] [${roomName}] ${msg.clientId}: ${msg.text.slice(0, 100)}`);
+
+      processMessage(conversationId, msg.text)
+        .then(async (response) => {
+          await room.messages.send({ text: response });
+          await execute(
+            `UPDATE locum1st.conversations
+             SET last_message_at = now(), last_message_preview = $2
+             WHERE id = $1`,
+            [conversationId, `Bot: ${response.slice(0, 100)}`]
+          );
+          console.log(`[${new Date().toISOString()}] [${roomName}] Bot replied.`);
+        })
+        .catch((err) => {
+          console.error(`[${roomName}] Error processing message:`, err);
+        })
+        .finally(() => {
+          processingQueue.delete(conversationId);
+        });
+    });
+
+    activeRooms.set(conversationId, room);
+    console.log(`[${new Date().toISOString()}] Attached to ${roomName}`);
+  } catch (err) {
+    console.error(`Failed to attach to room convo-${conversationId}:`, err);
+  }
+}
+
+async function pollConversations(chatClient: ChatClient) {
+  try {
+    const rows = await query<{ id: string }>(
+      `SELECT id FROM locum1st.conversations WHERE participant_a = $1 OR participant_b = $1`,
+      [BOT_USER_ID]
+    );
+
+    const newRooms = rows.filter((r) => !activeRooms.has(r.id));
+    if (newRooms.length > 0) {
+      console.log(`[${new Date().toISOString()}] Found ${newRooms.length} new conversation(s).`);
+      await Promise.all(newRooms.map((r) => attachToRoom(chatClient, r.id)));
+    }
+  } catch (err) {
+    console.error("Poll error:", err);
+  }
+}
+
+async function main() {
+  const realtime = new Ably.Realtime({
+    key: process.env.ABLY_API_KEY!,
+    clientId: BOT_USER_ID,
+  });
+
+  const chatClient = new ChatClient(realtime);
+
+  console.log(`[Staff1stBot] Starting — clientId: ${BOT_USER_ID}`);
+
+  await pollConversations(chatClient);
+  setInterval(() => pollConversations(chatClient), POLL_INTERVAL);
+
+  console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s for new conversations.`);
+
+  process.on("SIGINT", async () => {
+    console.log("\n[Staff1stBot] Shutting down...");
+    realtime.close();
+    process.exit(0);
+  });
+}
+
+main().catch((err) => {
+  console.error("[Staff1stBot] Fatal:", err);
+  process.exit(1);
+});
