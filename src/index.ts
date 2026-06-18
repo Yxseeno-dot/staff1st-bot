@@ -65,6 +65,15 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string, user
 
   try {
     const room = await chatClient.rooms.get(roomName);
+
+    room.onStatusChange((change) => {
+      console.log(`[${new Date().toISOString()}] [${roomName}] Status change: ${change.previous} -> ${change.current}`);
+      if (change.current === "detached" || change.current === "failed" || change.current === "suspended") {
+        console.log(`[${new Date().toISOString()}] [${roomName}] Room detached or failed. Removing from activeRooms map to force re-attachment.`);
+        activeRooms.delete(conversationId);
+      }
+    });
+
     await room.attach();
 
     room.messages.subscribe((event) => {
@@ -135,6 +144,21 @@ async function main() {
     key: process.env.ABLY_API_KEY!,
     clientId: BOT_USER_ID,
   });
+
+  realtime.connection.on("connected", () => {
+    console.log(`[${new Date().toISOString()}] Ably connection established.`);
+  });
+  realtime.connection.on("disconnected", () => {
+    console.warn(`[${new Date().toISOString()}] Ably connection disconnected.`);
+  });
+  realtime.connection.on("suspended", () => {
+    console.error(`[${new Date().toISOString()}] Ably connection suspended. Clearing active rooms map to force re-attachment.`);
+    activeRooms.clear();
+  });
+  realtime.connection.on("failed", () => {
+    console.error(`[${new Date().toISOString()}] Ably connection failed.`);
+  });
+
   const chatClient = new ChatClient(realtime);
 
   console.log(`[Staff1stBot] Starting — clientId: ${BOT_USER_ID}`);
