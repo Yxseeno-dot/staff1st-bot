@@ -1,40 +1,28 @@
 import "dotenv/config";
-import { randomUUID } from "crypto";
-import { queryOne, execute } from "./db.js";
+import { queryOne } from "./db.js";
 
-const BOT_NAME = "Staff1st Bot";
-const BOT_ROLE_TYPE = "bot";
+// 'bot-1stai' is the single canonical 1stAi account, seeded by Locum1st's own
+// instrumentation.ts. This bot must use that exact account — minting a separate
+// one here causes two role_type='bot' profiles, which makes Locum1st's "find
+// the bot to chat with" lookup ambiguous and can leave Staff1stBot listening on
+// a conversation no user is actually pointed at.
+const CANONICAL_BOT_ID = "bot-1stai";
 
 async function setup() {
-  const existingId = process.env.BOT_USER_ID;
-
-  // Check if already registered
   const existing = await queryOne<{ auth_user_id: string }>(
-    `SELECT auth_user_id FROM shared.user_profiles WHERE full_name = $1`,
-    [BOT_NAME]
+    `SELECT auth_user_id FROM locum1st.profiles WHERE auth_user_id = $1`,
+    [CANONICAL_BOT_ID]
   );
 
-  if (existing) {
-    console.log(`Bot user already exists.`);
-    console.log(`BOT_USER_ID=${existing.auth_user_id}`);
-    process.exit(0);
+  if (!existing) {
+    console.error(
+      `Canonical bot account '${CANONICAL_BOT_ID}' not found. It should be seeded by ` +
+      `Locum1st's instrumentation.ts — make sure Locum1st has started at least once first.`
+    );
+    process.exit(1);
   }
 
-  const id = existingId ?? randomUUID();
-
-  await execute(
-    `INSERT INTO shared.user_profiles (auth_user_id, full_name) VALUES ($1, $2) ON CONFLICT (auth_user_id) DO NOTHING`,
-    [id, BOT_NAME]
-  );
-
-  await execute(
-    `INSERT INTO locum1st.profiles (auth_user_id, role_type, onboarding_completed_at)
-     VALUES ($1, $2, now()) ON CONFLICT (auth_user_id) DO NOTHING`,
-    [id, BOT_ROLE_TYPE]
-  );
-
-  console.log(`Bot user created successfully.`);
-  console.log(`Add to your .env file:\nBOT_USER_ID=${id}`);
+  console.log(`Add to your .env file:\nBOT_USER_ID=${CANONICAL_BOT_ID}`);
   process.exit(0);
 }
 
