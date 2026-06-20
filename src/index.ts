@@ -1,130 +1,97 @@
 import "dotenv/config";
 import http from "http";
-import * as Ably from "ably";
-import { ChatClient, ChatMessageEventType } from "@ably/chat";
-import type { Room } from "@ably/chat";
-import { query, queryOne, execute } from "./db.js";
+import { query, execute } from "./db.js";
 import { processMessage, type BotReply } from "./ai.js";
 
 const BOT_USER_ID = process.env.BOT_USER_ID!;
-const BOT_NAME = "Staff1st Bot";
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS ?? "30000", 10);
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const CENTRIFUGO_URL = process.env.CENTRIFUGO_URL!;
+const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY!;
 
 if (!BOT_USER_ID) {
   console.error("BOT_USER_ID is required.");
   process.exit(1);
 }
-if (!process.env.ABLY_API_KEY) {
-  console.error("ABLY_API_KEY is required.");
+if (!CENTRIFUGO_URL || !CENTRIFUGO_API_KEY) {
+  console.error("CENTRIFUGO_URL and CENTRIFUGO_API_KEY are required.");
   process.exit(1);
 }
 
-const activeRooms = new Map<string, Room>();
-const processingQueue = new Map<string, boolean>();
+type UnprocessedMessage = {
+  id: string;
+  conversation_id: string;
+  text: string;
+  user_id: string;
+};
 
-async function ensureBotUser() {
-  const existing = await queryOne<{ auth_user_id: string }>(
-    `SELECT auth_user_id FROM shared.user_profiles WHERE auth_user_id = $1`,
-    [BOT_USER_ID]
-  );
-  if (!existing) {
-    console.log(`[Staff1stBot] Registering bot user (${BOT_USER_ID})...`);
-    await execute(
-      `INSERT INTO shared.user_profiles (auth_user_id, email, full_name)
-       VALUES ($1, $2, $3) ON CONFLICT (auth_user_id) DO NOTHING`,
-      [BOT_USER_ID, "staff1st-bot@internal.locum1st", BOT_NAME]
-    );
-  }
+const inFlight = new Set<string>();
 
-  // Ensure locum1st profile exists (needs user_profile_id FK)
-  const profileExists = await queryOne<{ auth_user_id: string }>(
-    `SELECT auth_user_id FROM locum1st.profiles WHERE auth_user_id = $1`,
-    [BOT_USER_ID]
-  );
-  if (!profileExists) {
-    const sharedProfile = await queryOne<{ id: number }>(
-      `SELECT id FROM shared.user_profiles WHERE auth_user_id = $1`,
-      [BOT_USER_ID]
-    );
-    if (sharedProfile) {
-      await execute(
-        `INSERT INTO locum1st.profiles (auth_user_id, user_profile_id, role_type, onboarding_completed_at)
-         VALUES ($1, $2, 'bot', now()) ON CONFLICT (auth_user_id) DO NOTHING`,
-        [BOT_USER_ID, sharedProfile.id]
-      );
-      console.log(`[Staff1stBot] Bot user registered.`);
-    }
+async function publish(channel: string, data: unknown): Promise<void> {
+  const res = await fetch(`${CENTRIFUGO_URL}/api/publish`, {
+    method: "POST",
+    headers: { "X-API-Key": CENTRIFUGO_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ channel, data }),
+  });
+  if (!res.ok) {
+    throw new Error(`Centrifugo publish failed: ${res.status} ${await res.text()}`);
   }
 }
 
-async function attachToRoom(chatClient: ChatClient, conversationId: string, userId: string) {
-  if (activeRooms.has(conversationId)) return;
+async function handleMessage(msg: UnprocessedMessage) {
+  console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] ${msg.user_id}: ${msg.text.slice(0, 100)}`);
 
-  const roomName = `convo-${conversationId}`;
-
+  let reply: BotReply;
   try {
-    const room = await chatClient.rooms.get(roomName);
-
-    room.onStatusChange((change) => {
-      console.log(`[${new Date().toISOString()}] [${roomName}] Status change: ${change.previous} -> ${change.current}`);
-      if (change.current === "detached" || change.current === "failed" || change.current === "suspended") {
-        console.log(`[${new Date().toISOString()}] [${roomName}] Room detached or failed. Removing from activeRooms map to force re-attachment.`);
-        activeRooms.delete(conversationId);
-      }
-    });
-
-    await room.attach();
-
-    room.messages.subscribe((event) => {
-      if (event.type !== ChatMessageEventType.Created) return;
-      const msg = event.message;
-      if (msg.clientId === BOT_USER_ID) return;
-      if (processingQueue.get(conversationId)) return;
-
-      processingQueue.set(conversationId, true);
-      console.log(`[${new Date().toISOString()}] [${roomName}] ${msg.clientId}: ${msg.text.slice(0, 100)}`);
-
-      processMessage(conversationId, userId, msg.text)
-        .then(async (reply: BotReply) => {
-          await room.messages.send({ text: reply.text, ...(reply.metadata ? { metadata: reply.metadata } : {}) });
-          await execute(
-            `UPDATE locum1st.conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
-            [conversationId, `Bot: ${reply.text.slice(0, 100)}`]
-          );
-          console.log(`[${new Date().toISOString()}] [${roomName}] Bot replied.`);
-        })
-        .catch(async (err) => {
-          console.error(`[${roomName}] Error:`, err);
-          try {
-            await room.messages.send({ text: "Sorry, I hit an error processing that. Please try again." });
-          } catch (sendErr) {
-            console.error(`[${roomName}] Failed to send error reply:`, sendErr);
-          }
-        })
-        .finally(() => processingQueue.delete(conversationId));
-    });
-
-    activeRooms.set(conversationId, room);
-    console.log(`[${new Date().toISOString()}] Attached to ${roomName}`);
+    reply = await processMessage(msg.conversation_id, msg.user_id, msg.text);
   } catch (err) {
-    console.error(`Failed to attach to room convo-${conversationId}:`, err);
+    console.error(`[convo-${msg.conversation_id}] Error:`, err);
+    reply = { text: "Sorry, I hit an error processing that. Please try again." };
   }
+
+  await execute(
+    `INSERT INTO locum1st.messages (conversation_id, sender_id, text, metadata)
+     VALUES ($1, $2, $3, $4)`,
+    [msg.conversation_id, BOT_USER_ID, reply.text, reply.metadata ?? null]
+  );
+
+  await execute(
+    `UPDATE locum1st.conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
+    [msg.conversation_id, `Bot: ${reply.text.slice(0, 100)}`]
+  );
+
+  await publish(`conversation:${msg.conversation_id}`, {
+    conversation_id: msg.conversation_id,
+    sender_id: BOT_USER_ID,
+    text: reply.text,
+    metadata: reply.metadata ?? null,
+    created_at: new Date().toISOString(),
+  });
+
+  await execute(`UPDATE locum1st.messages SET bot_processed = true WHERE id = $1`, [msg.id]);
+  console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] Bot replied.`);
 }
 
-async function pollConversations(chatClient: ChatClient) {
+async function pollMessages() {
   try {
-    const rows = await query<{ id: string; participant_a: string; participant_b: string }>(
-      `SELECT id, participant_a, participant_b FROM locum1st.conversations WHERE participant_a = $1 OR participant_b = $1`,
+    const rows = await query<UnprocessedMessage>(
+      `SELECT m.id, m.conversation_id, m.text,
+              CASE WHEN c.participant_a = $1 THEN c.participant_b ELSE c.participant_a END AS user_id
+       FROM locum1st.messages m
+       JOIN locum1st.conversations c ON c.id = m.conversation_id
+       WHERE m.bot_processed = false
+         AND m.sender_id <> $1
+         AND (c.participant_a = $1 OR c.participant_b = $1)
+       ORDER BY m.created_at ASC`,
       [BOT_USER_ID]
     );
-    const newRooms = rows.filter((r) => !activeRooms.has(r.id));
-    if (newRooms.length > 0) {
-      console.log(`[${new Date().toISOString()}] Found ${newRooms.length} new conversation(s).`);
-      await Promise.all(newRooms.map((r) => {
-        const userId = r.participant_a === BOT_USER_ID ? r.participant_b : r.participant_a;
-        return attachToRoom(chatClient, r.id, userId);
-      }));
+
+    for (const row of rows) {
+      if (inFlight.has(row.id)) continue;
+      inFlight.add(row.id);
+      handleMessage(row)
+        .catch((err) => console.error(`[convo-${row.conversation_id}] Failed to handle message:`, err))
+        .finally(() => inFlight.delete(row.id));
     }
   } catch (err) {
     console.error("Poll error:", err);
@@ -135,7 +102,7 @@ function startHealthServer() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", rooms: activeRooms.size }));
+      res.end(JSON.stringify({ status: "ok", inFlight: inFlight.size }));
     } else {
       res.writeHead(404);
       res.end();
@@ -145,39 +112,11 @@ function startHealthServer() {
 }
 
 async function main() {
-  await ensureBotUser();
-
-  const realtime = new Ably.Realtime({
-    key: process.env.ABLY_API_KEY!,
-    clientId: BOT_USER_ID,
-  });
-
-  realtime.connection.on("connected", () => {
-    console.log(`[${new Date().toISOString()}] Ably connection established.`);
-  });
-  realtime.connection.on("disconnected", () => {
-    console.warn(`[${new Date().toISOString()}] Ably connection disconnected.`);
-  });
-  realtime.connection.on("suspended", () => {
-    console.error(`[${new Date().toISOString()}] Ably connection suspended. Clearing active rooms map to force re-attachment.`);
-    activeRooms.clear();
-  });
-  realtime.connection.on("failed", () => {
-    console.error(`[${new Date().toISOString()}] Ably connection failed.`);
-  });
-
-  const chatClient = new ChatClient(realtime);
-
-  console.log(`[Staff1stBot] Starting — clientId: ${BOT_USER_ID}`);
-
+  console.log(`[Staff1stBot] Starting — userId: ${BOT_USER_ID}`);
   startHealthServer();
-  await pollConversations(chatClient);
-  setInterval(() => pollConversations(chatClient), POLL_INTERVAL);
-
+  await pollMessages();
+  setInterval(() => pollMessages(), POLL_INTERVAL);
   console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s.`);
-
-  process.on("SIGTERM", () => { realtime.close(); process.exit(0); });
-  process.on("SIGINT", () => { realtime.close(); process.exit(0); });
 }
 
 main().catch((err) => {

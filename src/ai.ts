@@ -10,7 +10,7 @@ const BASE = process.env.BOT_API_BASE ?? "https://locum1st.net/api/bot";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-// Recursive JSON-safe type compatible with Ably Chat's JsonObject
+// Recursive JSON-safe type, stored as JSONB on locum1st.messages.metadata
 type JsonVal = string | number | boolean | null | JsonVal[] | { [k: string]: JsonVal };
 export type BotMetadata = { [k: string]: JsonVal };
 

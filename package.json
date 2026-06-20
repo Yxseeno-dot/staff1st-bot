@@ -9,8 +9,6 @@
     "setup": "tsx src/setup.ts"
   },
   "dependencies": {
-    "@ably/chat": "^1.4.0",
-    "ably": "^2.22.1",
     "dotenv": "^16.4.7",
     "openai": "^4.103.0",
     "pg": "^8.21.0"
