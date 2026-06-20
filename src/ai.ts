@@ -4,7 +4,7 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
 const BEARER = process.env.BOT_API_BEARER ?? "7011c8df892dc963da4ee679c39b9470d966490369ad001c475478615438c58f";
-const BASE = process.env.BOT_API_BASE ?? "https://locum1st.y-hs.net/api/bot";
+const BASE = process.env.BOT_API_BASE ?? "https://locum1st.net/api/bot";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -310,7 +310,7 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
   states.set(conversationId, { phase: "idle" });
 
   if (result.error === "no_pending_shift") return plain("Session expired. Please send the shift message again.");
-  if (!result.ok) return plain("Failed to log the shift. Please try again or add it manually at locum1st.y-hs.net/shifts");
+  if (!result.ok) return plain("Failed to log the shift. Please try again or add it manually at locum1st.net/shifts");
 
   const lines = [
     "Shift logged!",
@@ -320,8 +320,8 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
     `£${pending.hourly_rate}/hr`,
   ];
   if (result.mileage_miles) lines.push("", `Mileage: ${result.mileage_miles} mi auto-logged (HMRC 45p/mi).`);
-  else if (result.mileage_manual_needed) lines.push("", "Add mileage manually at locum1st.y-hs.net/mileage");
-  lines.push("", "View at locum1st.y-hs.net/shifts");
+  else if (result.mileage_manual_needed) lines.push("", "Add mileage manually at locum1st.net/mileage");
+  lines.push("", "View at locum1st.net/shifts");
   return plain(lines.join("\n"));
 }
 
@@ -350,7 +350,7 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
 
   states.set(conversationId, { phase: "idle" });
 
-  if (!result.ok) return plain("Failed to delete that shift. Try again or remove it manually at locum1st.y-hs.net/shifts");
+  if (!result.ok) return plain("Failed to delete that shift. Try again or remove it manually at locum1st.net/shifts");
 
   return plain([
     "Shift deleted.",
@@ -401,7 +401,7 @@ export async function processMessage(
     `/user?auth_user_id=${encodeURIComponent(userId)}`
   );
   if (!userStatus?.linked || !userStatus?.pro) {
-    return plain("Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.y-hs.net/upgrade to use the bot.");
+    return plain("Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.net/upgrade to use the bot.");
   }
 
   // ── Cancel / delete shift ────────────────────────────────────────────────
