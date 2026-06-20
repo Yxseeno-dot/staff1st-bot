@@ -26,6 +26,11 @@ type UnprocessedMessage = {
 };
 
 const inFlight = new Set<string>();
+const MIN_TYPING_MS = 900;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function publish(channel: string, data: unknown): Promise<void> {
   const res = await fetch(`${CENTRIFUGO_URL}/api/publish`, {
@@ -43,6 +48,7 @@ async function handleMessage(msg: UnprocessedMessage) {
 
   const channel = `conversation:${msg.conversation_id}`;
   const sendTyping = () => publish(channel, { type: "typing", senderId: BOT_USER_ID }).catch(() => {});
+  const startedAt = Date.now();
   sendTyping();
   // Keep the typing indicator alive for as long as the AI call takes — the
   // client clears it after a few seconds of silence, so re-ping periodically.
@@ -56,6 +62,15 @@ async function handleMessage(msg: UnprocessedMessage) {
     reply = { text: "Sorry, I hit an error processing that. Please try again." };
   } finally {
     clearInterval(typingHeartbeat);
+  }
+
+  // The bot often replies in well under a second — too fast for the typing
+  // indicator to ever paint a frame before the real message replaces it.
+  // Pad out to a minimum "thinking" duration so the animation is actually
+  // visible instead of flashing on and off within the same render tick.
+  const elapsed = Date.now() - startedAt;
+  if (elapsed < MIN_TYPING_MS) {
+    await sleep(MIN_TYPING_MS - elapsed);
   }
 
   await execute(
