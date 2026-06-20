@@ -1,6 +1,8 @@
 import OpenAI from "openai";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Force Node's native fetch instead of the SDK's bundled node-fetch v2, which has a
+// known intermittent ERR_STREAM_PREMATURE_CLOSE bug on gzip-compressed responses.
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch });
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
 const BEARER = process.env.BOT_API_BEARER ?? "7011c8df892dc963da4ee679c39b9470d966490369ad001c475478615438c58f";

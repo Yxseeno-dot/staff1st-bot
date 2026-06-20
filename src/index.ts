@@ -94,7 +94,14 @@ async function attachToRoom(chatClient: ChatClient, conversationId: string, user
           );
           console.log(`[${new Date().toISOString()}] [${roomName}] Bot replied.`);
         })
-        .catch((err) => console.error(`[${roomName}] Error:`, err))
+        .catch(async (err) => {
+          console.error(`[${roomName}] Error:`, err);
+          try {
+            await room.messages.send({ text: "Sorry, I hit an error processing that. Please try again." });
+          } catch (sendErr) {
+            console.error(`[${roomName}] Failed to send error reply:`, sendErr);
+          }
+        })
         .finally(() => processingQueue.delete(conversationId));
     });
 
