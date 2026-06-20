@@ -41,12 +41,21 @@ async function publish(channel: string, data: unknown): Promise<void> {
 async function handleMessage(msg: UnprocessedMessage) {
   console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] ${msg.user_id}: ${msg.text.slice(0, 100)}`);
 
+  const channel = `conversation:${msg.conversation_id}`;
+  const sendTyping = () => publish(channel, { type: "typing", senderId: BOT_USER_ID }).catch(() => {});
+  sendTyping();
+  // Keep the typing indicator alive for as long as the AI call takes — the
+  // client clears it after a few seconds of silence, so re-ping periodically.
+  const typingHeartbeat = setInterval(sendTyping, 3000);
+
   let reply: BotReply;
   try {
     reply = await processMessage(msg.conversation_id, msg.user_id, msg.text);
   } catch (err) {
     console.error(`[convo-${msg.conversation_id}] Error:`, err);
     reply = { text: "Sorry, I hit an error processing that. Please try again." };
+  } finally {
+    clearInterval(typingHeartbeat);
   }
 
   await execute(
@@ -60,7 +69,7 @@ async function handleMessage(msg: UnprocessedMessage) {
     [msg.conversation_id, `Bot: ${reply.text.slice(0, 100)}`]
   );
 
-  await publish(`conversation:${msg.conversation_id}`, {
+  await publish(channel, {
     conversation_id: msg.conversation_id,
     sender_id: BOT_USER_ID,
     text: reply.text,
