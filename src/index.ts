@@ -1,7 +1,12 @@
 import "dotenv/config";
+import * as Sentry from "@sentry/node";
 import http from "http";
 import { query, execute } from "./db.js";
 import { processMessage, type BotReply } from "./ai.js";
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.1 });
+}
 
 const BOT_USER_ID = process.env.BOT_USER_ID!;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS ?? "30000", 10);
@@ -59,6 +64,7 @@ async function handleMessage(msg: UnprocessedMessage) {
     reply = await processMessage(msg.conversation_id, msg.user_id, msg.text);
   } catch (err) {
     console.error(`[convo-${msg.conversation_id}] Error:`, err);
+    Sentry.captureException(err);
     reply = { text: "Sorry, I hit an error processing that. Please try again." };
   } finally {
     clearInterval(typingHeartbeat);
@@ -114,11 +120,15 @@ async function pollMessages() {
       if (inFlight.has(row.id)) continue;
       inFlight.add(row.id);
       handleMessage(row)
-        .catch((err) => console.error(`[convo-${row.conversation_id}] Failed to handle message:`, err))
+        .catch((err) => {
+          console.error(`[convo-${row.conversation_id}] Failed to handle message:`, err);
+          Sentry.captureException(err);
+        })
         .finally(() => inFlight.delete(row.id));
     }
   } catch (err) {
     console.error("Poll error:", err);
+    Sentry.captureException(err);
   }
 }
 
@@ -143,7 +153,9 @@ async function main() {
   console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s.`);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error("[Staff1stBot] Fatal:", err);
+  Sentry.captureException(err);
+  await Sentry.flush(2000);
   process.exit(1);
 });
