@@ -5,7 +5,8 @@ import OpenAI from "openai";
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch });
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
-const BEARER = process.env.BOT_API_BEARER ?? "7011c8df892dc963da4ee679c39b9470d966490369ad001c475478615438c58f";
+const BEARER = process.env.BOT_API_BEARER;
+if (!BEARER) throw new Error("BOT_API_BEARER is required");
 const BASE = process.env.BOT_API_BASE ?? "https://locum1st.net/api/bot";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -50,7 +51,29 @@ type State =
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
-const states = new Map<string, State>();
+const STATE_TTL_MS = 10 * 60 * 1000;
+type StateEntry = { state: State; lastActivity: number };
+const states = new Map<string, StateEntry>();
+
+function getState(conversationId: string): State {
+  const entry = states.get(conversationId);
+  if (!entry || Date.now() - entry.lastActivity > STATE_TTL_MS) {
+    states.delete(conversationId);
+    return { phase: "idle" };
+  }
+  return entry.state;
+}
+
+function setState(conversationId: string, state: State): void {
+  states.set(conversationId, { state, lastActivity: Date.now() });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of states) {
+    if (now - entry.lastActivity > STATE_TTL_MS) states.delete(id);
+  }
+}, STATE_TTL_MS).unref();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +92,10 @@ async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
       ...(options?.headers ?? {}),
     },
   });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Bot API error ${res.status} for ${path}: ${body}`);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -175,7 +202,8 @@ function fmtDateShort(d: string): string {
 function hoursDecimal(start: string, end: string): number {
   const [sh, sm] = start.split(":").map(Number);
   const [eh, em] = end.split(":").map(Number);
-  return (eh * 60 + em - (sh * 60 + sm)) / 60;
+  const mins = eh * 60 + em - (sh * 60 + sm);
+  return (mins < 0 ? mins + 24 * 60 : mins) / 60;
 }
 
 // ─── Sub-handlers ─────────────────────────────────────────────────────────────
@@ -218,9 +246,20 @@ async function handleShiftAnalysis(
 
   type DistData = { oneway_miles?: number; return_miles?: number; duration_text?: string; error?: string };
   const toAddr = match?.address ?? ext.pharmacy_address ?? ext.pharmacy_postcode ?? ext.pharmacy_name ?? "";
-  const dist = await botFetch<DistData>(
-    `/distance?auth_user_id=${encodeURIComponent(userId)}&to=${encodeURIComponent(toAddr)}`
-  );
+  let dist: DistData = {};
+  if (toAddr) {
+    try {
+      dist = await botFetch<DistData>(
+        `/distance?auth_user_id=${encodeURIComponent(userId)}&to=${encodeURIComponent(toAddr)}`
+      );
+      console.log(`[${conversationId}] Distance result for "${toAddr}":`, JSON.stringify(dist));
+    } catch (err) {
+      console.error(`[${conversationId}] Distance lookup failed:`, err);
+      dist = { error: "lookup_failed" };
+    }
+  } else {
+    dist = { error: "no_address" };
+  }
 
   const hours = hoursDecimal(ext.start_time!, ext.end_time!);
   const shiftType = ext.shift_type ?? "standard";
@@ -241,58 +280,82 @@ async function handleShiftAnalysis(
     mileage_pence_per_mile: ext.mileage_pence_per_mile ?? undefined,
     mileage_threshold_miles: ext.mileage_threshold_miles ?? undefined,
   };
-  states.set(conversationId, { phase: "awaiting_confirmation", pending });
+  setState(conversationId, { phase: "awaiting_confirmation", pending });
 
   const lines: string[] = [];
-  lines.push("SHIFT SUMMARY");
-  lines.push(`Pharmacy: ${match?.name ?? ext.pharmacy_name ?? "Unknown"} (${match?.odsCode ?? "ODS not found"})`);
-  if (match?.address) lines.push(`Address: ${match.address}`);
-  lines.push(`Date: ${fmtDate(ext.shift_date!)} | ${ext.start_time}–${ext.end_time} (${hours % 1 === 0 ? hours : hours.toFixed(1)} hrs)`);
+  lines.push("**SHIFT SUMMARY**");
+  lines.push("");
+  lines.push(`**Pharmacy:** ${match?.name ?? ext.pharmacy_name ?? "Unknown"} (${match?.odsCode ?? "ODS not found"})`);
+  if (match?.address) lines.push(`**Address:** ${match.address}`);
+  lines.push(`**Date:** ${fmtDate(ext.shift_date!)} | ${ext.start_time}–${ext.end_time} (${hours % 1 === 0 ? hours : hours.toFixed(1)} hrs)`);
 
   if (!rateProvided) {
-    lines.push(`Rate: No rate offered — suggested: £${rate}/hr = £${totalPay} for the day`);
+    lines.push(`**Rate:** No rate offered — suggested: £${rate}/hr = £${totalPay} for the day`);
   } else {
-    lines.push(`Rate: £${rate}/hr = £${totalPay} for the day`);
+    lines.push(`**Rate:** £${rate}/hr = £${totalPay} for the day`);
   }
 
   if (!dist.error && dist.oneway_miles != null) {
-    lines.push(`Distance: ${dist.oneway_miles} mi one-way (${dist.return_miles} mi return) — ${dist.duration_text ?? "?"} drive`);
+    lines.push(`**Distance:** ${dist.oneway_miles} mi one-way (${dist.return_miles} mi return) — ${dist.duration_text ?? "?"} drive`);
   } else if (dist.error === "no_postcode") {
-    lines.push("Distance: Add your home postcode in account settings to get driving distance.");
+    lines.push("**Distance:** Add your home postcode in account settings.");
+  } else if (dist.error === "no_address") {
+    lines.push("**Distance:** No pharmacy address found — can't calculate route.");
+  } else if (dist.error === "no_route") {
+    lines.push(`**Distance:** Google couldn't find a route to "${toAddr}".`);
+  } else if (dist.error === "no_maps_key" || dist.error === "maps_api_error" || dist.error === "lookup_failed") {
+    lines.push("**Distance:** Unavailable (maps service error).");
   }
 
   lines.push("");
 
   if (avgItems != null) {
-    lines.push("WORKLOAD (avg last 6 months):");
+    lines.push("**WORKLOAD** (avg last 6 months)");
     lines.push(`Items: ~${avgItems.toLocaleString()}/month`);
     lines.push(`Pharmacy First: ~${(avgPF ?? 0).toLocaleString()}/month`);
     lines.push(`NMS: ~${(avgNms ?? 0).toLocaleString()}/month`);
     lines.push(`BP Checks: ~${(avgBp ?? 0).toLocaleString()}/month`);
   } else {
-    lines.push("WORKLOAD: No Data1st data available for this pharmacy.");
+    lines.push("**WORKLOAD:** No Data1st data available for this pharmacy.");
   }
 
   lines.push("");
 
   if (rateProvided && avgItems != null) {
-    lines.push(`VERDICT: ${verdict(rate, avgItems, shiftType)}`);
+    lines.push(`**VERDICT:** ${verdict(rate, avgItems, shiftType)}`);
     lines.push(verdictReason(rate, avgItems, shiftType));
   } else if (!rateProvided && avgItems != null) {
-    lines.push(`RATE SUGGESTION: £${recommendedRate(avgItems, shiftType)}/hr`);
+    lines.push(`**RATE SUGGESTION:** £${recommendedRate(avgItems, shiftType)}/hr`);
     lines.push(`Based on ${avgItems.toLocaleString()} items/month avg. Counter at or above this rate.`);
   } else if (rateProvided) {
-    lines.push(`VERDICT: ${verdict(rate, 3000, shiftType)} (no workload data — rate only)`);
+    lines.push(`**VERDICT:** ${verdict(rate, 3000, shiftType)} (no workload data — rate only)`);
     lines.push(`Market rate for a standard pharmacy is around £${recommendedRate(3000, shiftType)}/hr.`);
   }
 
   lines.push("");
 
   if (ext.mileage_paid && ext.mileage_pence_per_mile) {
-    const threshold = ext.mileage_threshold_miles ? ` after ${ext.mileage_threshold_miles} miles` : "";
-    lines.push(`Mileage: ${ext.mileage_pence_per_mile}p/mile${threshold} (pharmacy pays)`);
+    const ppm = ext.mileage_pence_per_mile;
+    const threshold = ext.mileage_threshold_miles ?? 0;
+    if (threshold > 0) {
+      lines.push(`**Mileage:** ${ppm}p/mile after the first ${threshold} miles each way (pharmacy pays)`);
+      lines.push(`The first ${threshold} miles each way are at your own cost — HMRC Mileage Tax Relief at 55p/mile applies to all miles.`);
+      if (!dist.error && dist.oneway_miles != null) {
+        const reimbursedOneWay = Math.max(0, dist.oneway_miles - threshold);
+        if (reimbursedOneWay > 0) {
+          const reimbursedReturn = reimbursedOneWay * 2;
+          const amount = (reimbursedReturn * ppm / 100).toFixed(2);
+          lines.push(`On this shift: ${reimbursedReturn.toFixed(1)} mi reimbursed by pharmacy (£${amount}), ${threshold} mi each way at your own cost.`);
+        } else {
+          lines.push(`On this shift: journey (${dist.oneway_miles} mi) is within the ${threshold} mi threshold — no reimbursement from pharmacy on this shift.`);
+        }
+      }
+    } else {
+      lines.push(`**Mileage:** ${ppm}p/mile (pharmacy pays all miles)`);
+      lines.push("HMRC Mileage Tax Relief at 55p/mile also applies.");
+    }
   } else {
-    lines.push("Mileage: HMRC 45p/mile (no reimbursement mentioned)");
+    lines.push("**Mileage:** HMRC Mileage Tax Relief at 55p/mile (no reimbursement mentioned)");
   }
 
   return confirmShift(lines.join("\n"));
@@ -309,19 +372,19 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
     body: JSON.stringify({ auth_user_id: userId, pending_shift: pending }),
   });
 
-  states.set(conversationId, { phase: "idle" });
+  setState(conversationId, { phase: "idle" });
 
   if (result.error === "no_pending_shift") return plain("Session expired. Please send the shift message again.");
   if (!result.ok) return plain("Failed to log the shift. Please try again or add it manually at locum1st.net/shifts");
 
   const lines = [
-    "Shift logged!",
+    "**Shift logged!**",
     "",
-    pending.pharmacy_name,
-    `${fmtDate(pending.shift_date)}, ${pending.start_time}–${pending.end_time}`,
-    `£${pending.hourly_rate}/hr`,
+    `**Pharmacy:** ${pending.pharmacy_name}`,
+    `**Date:** ${fmtDate(pending.shift_date)}, ${pending.start_time}–${pending.end_time}`,
+    `**Rate:** £${pending.hourly_rate}/hr`,
   ];
-  if (result.mileage_miles) lines.push("", `Mileage: ${result.mileage_miles} mi auto-logged (HMRC 45p/mi).`);
+  if (result.mileage_miles) lines.push("", `**Mileage:** ${result.mileage_miles} mi auto-logged (HMRC Mileage Tax Relief at 55p/mi).`);
   else if (result.mileage_manual_needed) lines.push("", "Add mileage manually at locum1st.net/mileage");
   lines.push("", "View at locum1st.net/shifts");
   return plain(lines.join("\n"));
@@ -334,14 +397,14 @@ async function handleListShiftsForDelete(conversationId: string, userId: string)
 
   if (!data.shifts?.length) return plain("You have no upcoming shifts logged.");
 
-  states.set(conversationId, { phase: "awaiting_delete", shifts: data.shifts });
+  setState(conversationId, { phase: "awaiting_delete", shifts: data.shifts });
 
   const list = data.shifts
-    .map((s, i) => `${i + 1}. ${s.pharmacy_name} — ${fmtDateShort(s.shift_date)}, ${s.start_time}–${s.end_time}`)
+    .map((s, i) => `${i + 1}. **${s.pharmacy_name}** — ${fmtDateShort(s.shift_date)}, ${s.start_time}–${s.end_time}`)
     .join("\n");
 
   const shiftMeta = data.shifts.map((s) => ({ name: s.pharmacy_name, date: fmtDateShort(s.shift_date) }));
-  return selectDelete(`Which shift do you want to cancel?\n\n${list}`, shiftMeta);
+  return selectDelete(`**Which shift do you want to cancel?**\n\n${list}`, shiftMeta);
 }
 
 async function handleDeleteShift(conversationId: string, userId: string, shift: Shift): Promise<BotReply> {
@@ -350,15 +413,15 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
     body: JSON.stringify({ auth_user_id: userId, shift_id: shift.id }),
   });
 
-  states.set(conversationId, { phase: "idle" });
+  setState(conversationId, { phase: "idle" });
 
   if (!result.ok) return plain("Failed to delete that shift. Try again or remove it manually at locum1st.net/shifts");
 
   return plain([
-    "Shift deleted.",
+    "**Shift deleted.**",
     "",
-    shift.pharmacy_name,
-    `${fmtDate(shift.shift_date)}, ${shift.start_time}–${shift.end_time}`,
+    `**Pharmacy:** ${shift.pharmacy_name}`,
+    `**Date:** ${fmtDate(shift.shift_date)}, ${shift.start_time}–${shift.end_time}`,
     "",
     "The linked mileage log has also been removed.",
   ].join("\n"));
@@ -371,7 +434,7 @@ export async function processMessage(
   userId: string,
   text: string
 ): Promise<BotReply> {
-  const state = states.get(conversationId) ?? { phase: "idle" };
+  const state = getState(conversationId);
   const trimmed = text.trim();
 
   // ── Awaiting YES/NO ──────────────────────────────────────────────────────
@@ -380,10 +443,10 @@ export async function processMessage(
       return handleSaveShift(conversationId, userId, state.pending);
     }
     if (/^(no|n|decline|skip|nope|cancel|pass)\b/i.test(trimmed)) {
-      states.set(conversationId, { phase: "idle" });
+      setState(conversationId, { phase: "idle" });
       return plain("Shift declined. Send another shift offer whenever you're ready.");
     }
-    states.set(conversationId, { phase: "idle" });
+    setState(conversationId, { phase: "idle" });
   }
 
   // ── Awaiting delete selection ────────────────────────────────────────────
@@ -395,7 +458,7 @@ export async function processMessage(
     if (/^\d+$/.test(trimmed)) {
       return plain(`That number isn't in the list. Reply with a number from 1 to ${state.shifts.length}.`);
     }
-    states.set(conversationId, { phase: "idle" });
+    setState(conversationId, { phase: "idle" });
   }
 
   // ── Pro check ───────────────────────────────────────────────────────────
@@ -419,13 +482,13 @@ export async function processMessage(
     const data = await botFetch<{ shifts?: Shift[] }>(`/shifts?auth_user_id=${encodeURIComponent(userId)}`);
     if (!data.shifts?.length) return plain("You have no recent shifts logged.");
     return plain(data.shifts
-      .map((s, i) => `${i + 1}. ${s.pharmacy_name} — ${fmtDate(s.shift_date)}, ${s.start_time}–${s.end_time}, £${s.hourly_rate}/hr`)
+      .map((s, i) => `${i + 1}. **${s.pharmacy_name}** — ${fmtDate(s.shift_date)}, ${s.start_time}–${s.end_time}, £${s.hourly_rate}/hr`)
       .join("\n"));
   }
 
   // ── Greeting ────────────────────────────────────────────────────────────
   if (/^(hi|hello|hey|help|what can you|what do you)\b/i.test(trimmed.toLowerCase()) && trimmed.length < 40) {
-    return plain("Send me a shift offer and I'll analyse it — rate vs workload, driving distance, and whether the pay is fair — then log it to your profile if you want to accept it.");
+    return plain("Send me a shift offer and I'll analyse it:\n\n**Rate** vs workload\n**Driving distance** from your home\n**Verdict** on whether the pay is fair\n\nThen log it to your shifts if you want to accept it.");
   }
 
   // ── Extract shift offer ─────────────────────────────────────────────────

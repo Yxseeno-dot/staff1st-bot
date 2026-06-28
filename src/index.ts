@@ -31,6 +31,7 @@ type UnprocessedMessage = {
 };
 
 const inFlight = new Set<string>();
+const inFlightConvos = new Set<string>();
 const MIN_TYPING_MS = 900;
 
 function sleep(ms: number) {
@@ -90,6 +91,10 @@ async function handleMessage(msg: UnprocessedMessage) {
     [msg.conversation_id, `Bot: ${reply.text.slice(0, 100)}`]
   );
 
+  // Mark processed before publishing so a Centrifugo failure doesn't cause a
+  // duplicate reply on the next poll. The client re-fetches messages on reconnect.
+  await execute(`UPDATE locum1st.messages SET bot_processed = true WHERE id = $1`, [msg.id]);
+
   await publish(channel, {
     conversation_id: msg.conversation_id,
     sender_id: BOT_USER_ID,
@@ -97,8 +102,6 @@ async function handleMessage(msg: UnprocessedMessage) {
     metadata: reply.metadata ?? null,
     created_at: new Date().toISOString(),
   });
-
-  await execute(`UPDATE locum1st.messages SET bot_processed = true WHERE id = $1`, [msg.id]);
   console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] Bot replied.`);
 }
 
@@ -118,13 +121,18 @@ async function pollMessages() {
 
     for (const row of rows) {
       if (inFlight.has(row.id)) continue;
+      if (inFlightConvos.has(row.conversation_id)) continue;
       inFlight.add(row.id);
+      inFlightConvos.add(row.conversation_id);
       handleMessage(row)
         .catch((err) => {
           console.error(`[convo-${row.conversation_id}] Failed to handle message:`, err);
           Sentry.captureException(err);
         })
-        .finally(() => inFlight.delete(row.id));
+        .finally(() => {
+          inFlight.delete(row.id);
+          inFlightConvos.delete(row.conversation_id);
+        });
     }
   } catch (err) {
     console.error("Poll error:", err);
