@@ -2,7 +2,11 @@ import OpenAI from "openai";
 
 // Force Node's native fetch instead of the SDK's bundled node-fetch v2, which has a
 // known intermittent ERR_STREAM_PREMATURE_CLOSE bug on gzip-compressed responses.
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch });
+// Explicit timeout: the SDK's own default is 10 minutes, which is effectively
+// unbounded from a chat UX perspective — a stalled OpenAI response would hang
+// processMessage() forever, leaving the bot's "typing" heartbeat running
+// indefinitely (see botFetch below for the matching issue on our own API calls).
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch, timeout: 20_000 });
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
 const BEARER = process.env.BOT_API_BEARER;
@@ -95,20 +99,39 @@ function selectDates(text: string, dates: string[]): BotReply {
   return { text, metadata: { action: "select_dates", dates: dates as unknown as JsonVal } };
 }
 
+const BOT_FETCH_TIMEOUT_MS = 15_000;
+
+// Without a timeout, a stalled upstream response (Locum1st's API, or Google
+// Maps inside its /distance route) leaves processMessage() awaiting forever —
+// which means handleMessage()'s typing-ping interval (index.ts) never reaches
+// its `finally` and clears, so the client's typing indicator gets refreshed
+// every 3s indefinitely instead of self-clearing after a few seconds.
 async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${BEARER}`,
-      "Content-Type": "application/json",
-      ...(options?.headers ?? {}),
-    },
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Bot API error ${res.status} for ${path}: ${body}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BOT_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${BEARER}`,
+        "Content-Type": "application/json",
+        ...(options?.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Bot API error ${res.status} for ${path}: ${body}`);
+    }
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Bot API timed out after ${BOT_FETCH_TIMEOUT_MS}ms for ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json() as Promise<T>;
 }
 
 // ─── Shift extraction via LLM ─────────────────────────────────────────────────
@@ -424,9 +447,7 @@ async function handleShiftAnalysis(
     if (cap) rateDesc += `, up to ${cap} miles each way`;
     lines.push(`**Mileage:** ${rateDesc} (pharmacy pays)`);
     if (threshold > 0) {
-      lines.push(`The first ${threshold} miles each way are at your own cost — HMRC Mileage Tax Relief at 55p/mile applies to all miles.`);
-    } else {
-      lines.push("HMRC Mileage Tax Relief at 55p/mile also applies.");
+      lines.push(`The first ${threshold} miles each way are at your own cost.`);
     }
     if (!dist.error && dist.oneway_miles != null) {
       const cappedOneWay = cap ? Math.min(dist.oneway_miles, cap) : dist.oneway_miles;
@@ -442,9 +463,8 @@ async function handleShiftAnalysis(
     }
   } else if (ext.travel_allowance_fixed) {
     lines.push(`**Mileage:** Fixed travel allowance of £${ext.travel_allowance_fixed} for the shift.`);
-    lines.push("HMRC Mileage Tax Relief at 55p/mile also applies on top of the allowance.");
   } else {
-    lines.push("**Mileage:** HMRC Mileage Tax Relief at 55p/mile (no reimbursement mentioned)");
+    lines.push("**Mileage:** Not reimbursed by the pharmacy.");
   }
 
   if (dates.length === 1) {
@@ -487,7 +507,7 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
   if (pending.break_duration_minutes) {
     lines.push(`**Break:** ${pending.break_duration_minutes} min ${pending.break_paid ? "paid" : "unpaid"}`);
   }
-  if (result.mileage_miles) lines.push("", `**Mileage:** ${result.mileage_miles} mi auto-logged (HMRC Mileage Tax Relief at 55p/mi).`);
+  if (result.mileage_miles) lines.push("", `**Mileage:** ${result.mileage_miles} mi auto-logged.`);
   else if (result.mileage_manual_needed) lines.push("", "Add mileage manually at locum1st.net/mileage");
   if (pending.travel_allowance_fixed) lines.push("", `**Travel allowance:** £${pending.travel_allowance_fixed} fixed.`);
   lines.push("", "View at locum1st.net/shifts");

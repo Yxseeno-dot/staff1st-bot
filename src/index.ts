@@ -38,14 +38,39 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function publish(channel: string, data: unknown): Promise<void> {
-  const res = await fetch(`${CENTRIFUGO_URL}/api/publish`, {
-    method: "POST",
-    headers: { "X-API-Key": CENTRIFUGO_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ channel, data }),
+// Rejects with `label` after `ms` if `promise` hasn't settled — a safety net
+// so a hang anywhere inside processMessage() (a stalled DB query, a stuck
+// upstream call we didn't anticipate) can't keep the typing-ping interval in
+// handleMessage() alive forever. This doesn't cancel the original promise —
+// Node can't cancel arbitrary work — it just stops waiting on it so the bot
+// can send a fallback reply and move on to the next message.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
   });
-  if (!res.ok) {
-    throw new Error(`Centrifugo publish failed: ${res.status} ${await res.text()}`);
+}
+
+const PUBLISH_TIMEOUT_MS = 10_000;
+
+async function publish(channel: string, data: unknown): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PUBLISH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${CENTRIFUGO_URL}/api/publish`, {
+      method: "POST",
+      headers: { "X-API-Key": CENTRIFUGO_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, data }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Centrifugo publish failed: ${res.status} ${await res.text()}`);
+    }
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -62,7 +87,11 @@ async function handleMessage(msg: UnprocessedMessage) {
 
   let reply: BotReply;
   try {
-    reply = await processMessage(msg.conversation_id, msg.user_id, msg.text);
+    reply = await withTimeout(
+      processMessage(msg.conversation_id, msg.user_id, msg.text),
+      45_000,
+      "processMessage"
+    );
   } catch (err) {
     console.error(`[convo-${msg.conversation_id}] Error:`, err);
     Sentry.captureException(err);
