@@ -66,7 +66,10 @@ type State =
   | { phase: "idle" }
   | { phase: "awaiting_confirmation"; pending: PendingShift }
   | { phase: "awaiting_delete"; shifts: Shift[] }
-  | { phase: "awaiting_date_selection"; template: ShiftTemplate; dates: string[] };
+  // Flat list rather than one shared template + dates — covers both a single
+  // pharmacy offered on several dates AND a multi-pharmacy broadcast, since
+  // each candidate is already a fully-resolved shift in its own right.
+  | { phase: "awaiting_date_selection"; candidates: PendingShift[] };
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
@@ -142,8 +145,34 @@ async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
 
 // ─── Shift extraction via LLM ─────────────────────────────────────────────────
 
+// One pharmacy's dates/times within a multi-pharmacy offer — rate, break,
+// mileage terms and pmr_system are shared across all groups and live only on
+// ShiftExtraction (a broadcast rarely varies those per location).
+type ShiftGroupRaw = {
+  pharmacy_name?: string | null;
+  pharmacy_postcode?: string | null;
+  pharmacy_address?: string | null;
+  shift_dates?: string[];
+  start_time?: string | null;
+  end_time?: string | null;
+};
+
+type ShiftGroup = {
+  pharmacy_name?: string;
+  pharmacy_postcode?: string;
+  pharmacy_address?: string;
+  shift_dates: string[];
+  start_time: string;
+  end_time: string;
+};
+
 type ShiftExtraction = {
   is_shift_offer: boolean;
+  // Set when the message offers shifts at more than one distinct pharmacy —
+  // each with its own dates/times. When absent, the top-level
+  // pharmacy_name/shift_dates/start_time/end_time fields below describe the
+  // single (possibly multi-date) offer, as before.
+  groups?: ShiftGroupRaw[];
   pharmacy_name?: string;
   pharmacy_postcode?: string;
   pharmacy_address?: string;
@@ -161,6 +190,37 @@ type ShiftExtraction = {
   travel_allowance_fixed?: number | null;
   pmr_system?: string | null;
 };
+
+// Resolves the message into one or more pharmacy groups, each with concrete
+// dates/times — either the LLM's own `groups` (multi-pharmacy offer) or a
+// single group built from the legacy flat fields (the common case). Drops
+// any group missing dates/start/end rather than failing the whole message.
+function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
+  const raw: ShiftGroupRaw[] = ext.groups?.length
+    ? ext.groups
+    : [{
+        pharmacy_name: ext.pharmacy_name,
+        pharmacy_postcode: ext.pharmacy_postcode,
+        pharmacy_address: ext.pharmacy_address,
+        shift_dates: ext.shift_dates,
+        start_time: ext.start_time,
+        end_time: ext.end_time,
+      }];
+
+  const groups: ShiftGroup[] = [];
+  for (const g of raw) {
+    if (!g.shift_dates?.length || !g.start_time || !g.end_time) continue;
+    groups.push({
+      pharmacy_name: g.pharmacy_name ?? undefined,
+      pharmacy_postcode: g.pharmacy_postcode ?? undefined,
+      pharmacy_address: g.pharmacy_address ?? undefined,
+      shift_dates: g.shift_dates,
+      start_time: g.start_time,
+      end_time: g.end_time,
+    });
+  }
+  return groups;
+}
 
 type HistoryTurn = { role: "user" | "assistant"; content: string };
 
@@ -198,14 +258,17 @@ Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock"
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
 If end_time would be earlier than start_time, that's an overnight shift spanning into the next day — extract the times as given rather than treating them as invalid.
 If the SAME shift pattern (same pharmacy, times, and rate) is offered across multiple dates — a rota, a list of days ("Mon/Wed/Fri"), or a phrase like "every day next week" — include every date in shift_dates, not just the first one you see.
+If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names/addresses, each with its own date(s) and/or times — e.g. a multi-branch broadcast like "13 July: Prescot Road ... / 30 July: Moreton ..."), put one object per pharmacy in the "groups" array instead of using the top-level pharmacy_name/shift_dates/start_time/end_time fields — leave those top-level fields null in that case. Each group needs its own pharmacy_name/pharmacy_postcode/pharmacy_address/shift_dates/start_time/end_time. Do NOT create a group per date for a SINGLE pharmacy's rota — that's still just shift_dates on one group (or the top-level fields, if there's only one pharmacy overall).
+hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
 - is_shift_offer: boolean
-- pharmacy_name: string | null
-- pharmacy_postcode: string | null
-- pharmacy_address: string | null
-- shift_dates: array of "YYYY-MM-DD" strings — every date this shift pattern applies to (usually just one, but see above)
-- start_time: "HH:MM" | null (24h)
-- end_time: "HH:MM" | null (24h)
+- groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
+- pharmacy_name: string | null (only when NOT using groups)
+- pharmacy_postcode: string | null (only when NOT using groups)
+- pharmacy_address: string | null (only when NOT using groups)
+- shift_dates: array of "YYYY-MM-DD" strings (only when NOT using groups) — every date this shift pattern applies to (usually just one, but see above)
+- start_time: "HH:MM" | null (24h, only when NOT using groups)
+- end_time: "HH:MM" | null (24h, only when NOT using groups)
 - hourly_rate: number | null
 - shift_type: "standard" | "overnight" | "bank_holiday"
 - break_duration_minutes: number | null (length of any lunch/rest break mentioned, in minutes)
@@ -386,16 +449,22 @@ function logPmrObservation(
 
 // ─── Sub-handlers ─────────────────────────────────────────────────────────────
 
-async function handleShiftAnalysis(
+// Runs the full pharmacy lookup / workload / distance / market-rate / verdict
+// analysis for ONE pharmacy group. rate/break/mileage/pmr_system come from
+// `ext` (shared across every group in the message); everything pharmacy- and
+// date-specific comes from `group`. Returns one PendingShift candidate per
+// date in the group, plus the formatted summary block for that group.
+async function analyzeGroup(
   conversationId: string,
   userId: string,
-  ext: ShiftExtraction
-): Promise<BotReply> {
+  ext: ShiftExtraction,
+  group: ShiftGroup
+): Promise<{ candidates: PendingShift[]; lines: string[] }> {
   // Build the best possible search query from whatever pharmacy info is available
   const searchQuery = [
-    ext.pharmacy_name,
-    ext.pharmacy_postcode,
-    ext.pharmacy_address,
+    group.pharmacy_name,
+    group.pharmacy_postcode,
+    group.pharmacy_address,
   ].filter(Boolean).join(" ").trim();
 
   let match: { odsCode: string; name: string; address: string } | undefined;
@@ -406,14 +475,14 @@ async function handleShiftAnalysis(
     match = pharmacyData.results?.[0];
   }
 
-  const pharmacyNameForLog = match?.name ?? ext.pharmacy_name;
+  const pharmacyNameForLog = match?.name ?? group.pharmacy_name;
   if (ext.pmr_system && pharmacyNameForLog) {
     logPmrObservation(
       conversationId,
       userId,
       pharmacyNameForLog,
       match?.odsCode,
-      match?.address ?? ext.pharmacy_address,
+      match?.address ?? group.pharmacy_address,
       ext.pmr_system
     );
   }
@@ -435,7 +504,7 @@ async function handleShiftAnalysis(
   const avgBp = avg("bpChecks");
 
   type DistData = { oneway_miles?: number; return_miles?: number; duration_text?: string; error?: string };
-  const toAddr = match?.address ?? ext.pharmacy_address ?? ext.pharmacy_postcode ?? ext.pharmacy_name ?? "";
+  const toAddr = match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode ?? group.pharmacy_name ?? "";
   let dist: DistData = {};
   if (toAddr) {
     try {
@@ -451,16 +520,16 @@ async function handleShiftAnalysis(
     dist = { error: "no_address" };
   }
 
-  const rawHours = hoursDecimal(ext.start_time!, ext.end_time!);
+  const rawHours = hoursDecimal(group.start_time, group.end_time);
   const breakMinutes = ext.break_duration_minutes ?? 0;
   const breakPaid = ext.break_paid ?? false;
   const hours = paidHours(rawHours, breakMinutes, breakPaid);
   const shiftType = ext.shift_type ?? "standard";
 
   const market = await fetchMarketRate(
-    ext.pharmacy_postcode,
-    match?.address ?? ext.pharmacy_address,
-    ext.shift_dates![0]!,
+    group.pharmacy_postcode,
+    match?.address ?? group.pharmacy_address,
+    group.shift_dates[0]!,
     avgItems
   );
   // Market comparison doesn't classify by overnight (only area/tier/bank-holiday/
@@ -472,11 +541,11 @@ async function handleShiftAnalysis(
   const totalPay = (rate * hours).toFixed(0);
 
   const template: ShiftTemplate = {
-    pharmacy_name: match?.name ?? ext.pharmacy_name ?? "Unknown",
-    pharmacy_address: match?.address ?? ext.pharmacy_address ?? ext.pharmacy_postcode,
+    pharmacy_name: match?.name ?? group.pharmacy_name ?? "Unknown",
+    pharmacy_address: match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode,
     pharmacy_ods_code: match?.odsCode,
-    start_time: ext.start_time!,
-    end_time: ext.end_time!,
+    start_time: group.start_time,
+    end_time: group.end_time,
     hourly_rate: rate,
     shift_type: shiftType,
     break_duration_minutes: breakMinutes || undefined,
@@ -487,19 +556,18 @@ async function handleShiftAnalysis(
     mileage_cap_miles: ext.mileage_cap_miles ?? undefined,
     travel_allowance_fixed: ext.travel_allowance_fixed ?? undefined,
   };
-  const dates = ext.shift_dates!;
+  const dates = group.shift_dates;
+  const candidates: PendingShift[] = dates.map((d) => ({ ...template, shift_date: d }));
 
   const lines: string[] = [];
-  lines.push("**SHIFT SUMMARY**");
-  lines.push("");
-  lines.push(`**Pharmacy:** ${match?.name ?? ext.pharmacy_name ?? "Unknown"} (${match?.odsCode ?? "ODS not found"})`);
+  lines.push(`**Pharmacy:** ${match?.name ?? group.pharmacy_name ?? "Unknown"} (${match?.odsCode ?? "ODS not found"})`);
   if (match?.address) lines.push(`**Address:** ${match.address}`);
   const hoursLabel = hours % 1 === 0 ? hours : hours.toFixed(1);
   const breakNote = breakMinutes > 0 ? ` — ${breakMinutes} min ${breakPaid ? "paid" : "unpaid"} break` : "";
   if (dates.length === 1) {
-    lines.push(`**Date:** ${fmtDate(dates[0])} | ${ext.start_time}–${ext.end_time} (${hoursLabel} hrs paid${breakNote})`);
+    lines.push(`**Date:** ${fmtDate(dates[0])} | ${group.start_time}–${group.end_time} (${hoursLabel} hrs paid${breakNote})`);
   } else {
-    lines.push(`**Time:** ${ext.start_time}–${ext.end_time} (${hoursLabel} hrs paid${breakNote}) — offered on ${dates.length} dates, see below`);
+    lines.push(`**Time:** ${group.start_time}–${group.end_time} (${hoursLabel} hrs paid${breakNote}) — offered on ${dates.length} dates, see below`);
   }
 
   if (!rateProvided) {
@@ -583,18 +651,50 @@ async function handleShiftAnalysis(
     lines.push("**Mileage:** Not reimbursed by the pharmacy.");
   }
 
-  if (dates.length === 1) {
-    setState(conversationId, { phase: "awaiting_confirmation", pending: { ...template, shift_date: dates[0] } });
+  return { candidates, lines };
+}
+
+// Orchestrates one or more pharmacy groups from the same message. A single
+// group renders exactly as a standalone shift always has; multiple groups
+// (a multi-branch broadcast) get numbered sub-headers and a combined
+// selection list spanning every date at every pharmacy.
+async function handleShiftAnalysis(
+  conversationId: string,
+  userId: string,
+  ext: ShiftExtraction,
+  groups: ShiftGroup[]
+): Promise<BotReply> {
+  const analyzed = await Promise.all(groups.map((group) => analyzeGroup(conversationId, userId, ext, group)));
+  const candidates = analyzed.flatMap((a) => a.candidates);
+
+  const lines: string[] = [];
+  if (groups.length === 1) {
+    lines.push("**SHIFT SUMMARY**", "");
+    lines.push(...analyzed[0]!.lines);
+  } else {
+    lines.push(`**${groups.length} SHIFTS AVAILABLE**`);
+    analyzed.forEach((a, i) => {
+      lines.push("", `**${i + 1}. ${groups[i]!.pharmacy_name ?? "Pharmacy"}**`, ...a.lines);
+    });
+  }
+
+  if (candidates.length === 1) {
+    setState(conversationId, { phase: "awaiting_confirmation", pending: candidates[0]! });
     return confirmShift(lines.join("\n"));
   }
 
-  setState(conversationId, { phase: "awaiting_date_selection", template, dates });
+  setState(conversationId, { phase: "awaiting_date_selection", candidates });
   lines.push("");
-  lines.push("**WHICH DATES DO YOU WANT TO LOG?**");
-  dates.forEach((d, i) => lines.push(`${i + 1}. ${fmtDateWeekdayShort(d)}`));
+  lines.push("**WHICH SHIFTS DO YOU WANT TO LOG?**");
+  candidates.forEach((c, i) =>
+    lines.push(`${i + 1}. ${c.pharmacy_name} — ${fmtDateWeekdayShort(c.shift_date)}, ${c.start_time}–${c.end_time}`)
+  );
   lines.push("");
-  lines.push('Reply with the numbers you want (e.g. "1,3"), "all" to log every date, or "none" to skip.');
-  return selectDates(lines.join("\n"), dates.map(fmtDateWeekdayShort));
+  lines.push('Reply with the numbers you want (e.g. "1,3"), "all" to log every shift, or "none" to skip.');
+  return selectDates(
+    lines.join("\n"),
+    candidates.map((c) => `${fmtDateWeekdayShort(c.shift_date)} – ${c.pharmacy_name}`)
+  );
 }
 
 async function handleSaveShift(conversationId: string, userId: string, pending: PendingShift): Promise<BotReply> {
@@ -630,21 +730,23 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
   return plain(lines.join("\n"));
 }
 
-// Logs the same shift template across several selected dates — one
-// /save-shift call per date, reusing the existing single-shift endpoint
-// (there's no batch endpoint), then reports one combined confirmation.
+// Logs a flat list of already-resolved shift candidates — one /save-shift
+// call per candidate, reusing the existing single-shift endpoint (there's no
+// batch endpoint). Candidates may span different pharmacies/times/rates (a
+// multi-branch broadcast), not just different dates of the same template, so
+// each result line and the total are computed per-candidate rather than
+// assuming one shared template.
 async function handleSaveShifts(
   conversationId: string,
   userId: string,
-  template: ShiftTemplate,
-  dates: string[]
+  candidates: PendingShift[]
 ): Promise<BotReply> {
   setState(conversationId, { phase: "idle" });
 
-  if (!dates.length) return plain("No dates selected. Send another shift offer whenever you're ready.");
+  if (!candidates.length) return plain("No shifts selected. Send another shift offer whenever you're ready.");
 
-  const results: Array<{ date: string; ok: boolean; mileage_miles?: number | null; mileage_manual_needed?: boolean }> = [];
-  for (const date of dates) {
+  const results: Array<{ candidate: PendingShift; ok: boolean; mileage_miles?: number | null; mileage_manual_needed?: boolean }> = [];
+  for (const candidate of candidates) {
     try {
       const result = await botFetch<{
         ok?: boolean;
@@ -652,12 +754,12 @@ async function handleSaveShifts(
         mileage_manual_needed?: boolean;
       }>("/save-shift", {
         method: "POST",
-        body: JSON.stringify({ auth_user_id: userId, pending_shift: { ...template, shift_date: date } }),
+        body: JSON.stringify({ auth_user_id: userId, pending_shift: candidate }),
       });
-      results.push({ date, ok: !!result.ok, mileage_miles: result.mileage_miles, mileage_manual_needed: result.mileage_manual_needed });
+      results.push({ candidate, ok: !!result.ok, mileage_miles: result.mileage_miles, mileage_manual_needed: result.mileage_manual_needed });
     } catch (err) {
-      console.error(`[${conversationId}] Failed to save shift for ${date}:`, err);
-      results.push({ date, ok: false });
+      console.error(`[${conversationId}] Failed to save shift for ${candidate.shift_date} at ${candidate.pharmacy_name}:`, err);
+      results.push({ candidate, ok: false });
     }
   }
 
@@ -668,37 +770,39 @@ async function handleSaveShifts(
     return plain("Failed to log those shifts. Please try again or add them manually at locum1st.net/shifts");
   }
 
-  const lines = [
-    succeeded.length > 1 ? "**Shifts logged!**" : "**Shift logged!**",
-    "",
-    `**Pharmacy:** ${template.pharmacy_name}`,
-    `**Time:** ${template.start_time}–${template.end_time}`,
-    `**Rate:** £${template.hourly_rate}/hr`,
-  ];
-  if (template.break_duration_minutes) {
-    lines.push(`**Break:** ${template.break_duration_minutes} min ${template.break_paid ? "paid" : "unpaid"}`);
-  }
-  lines.push("");
+  const lines = [succeeded.length > 1 ? "**Shifts logged!**" : "**Shift logged!**", ""];
+  let totalPay = 0;
   for (const r of succeeded) {
+    const c = r.candidate;
+    const perShiftHours = paidHours(
+      hoursDecimal(c.start_time, c.end_time),
+      c.break_duration_minutes ?? 0,
+      c.break_paid ?? false
+    );
+    totalPay += perShiftHours * c.hourly_rate;
     const mileageNote = r.mileage_miles
       ? ` — ${r.mileage_miles} mi auto-logged`
       : r.mileage_manual_needed
       ? " — add mileage manually"
       : "";
-    lines.push(`✓ ${fmtDate(r.date)}${mileageNote}`);
+    lines.push(`✓ **${c.pharmacy_name}** — ${fmtDate(c.shift_date)}, ${c.start_time}–${c.end_time}, £${c.hourly_rate}/hr${mileageNote}`);
   }
 
-  const perShiftHours = paidHours(
-    hoursDecimal(template.start_time, template.end_time),
-    template.break_duration_minutes ?? 0,
-    template.break_paid ?? false
-  );
-  const totalPay = (succeeded.length * perShiftHours * template.hourly_rate).toFixed(0);
-  lines.push("", `**Total:** £${totalPay} across ${succeeded.length} shift${succeeded.length > 1 ? "s" : ""}`);
-  if (template.travel_allowance_fixed) lines.push("", `**Travel allowance:** £${template.travel_allowance_fixed} fixed per shift.`);
+  lines.push("", `**Total:** £${totalPay.toFixed(0)} across ${succeeded.length} shift${succeeded.length > 1 ? "s" : ""}`);
+
+  const fixedAllowances = succeeded
+    .map((r) => r.candidate.travel_allowance_fixed)
+    .filter((a): a is number => !!a);
+  if (fixedAllowances.length) {
+    const totalAllowance = fixedAllowances.reduce((s, a) => s + a, 0);
+    lines.push("", `**Travel allowance:** £${totalAllowance.toFixed(0)} total (fixed per shift).`);
+  }
 
   if (failed.length) {
-    lines.push("", `Couldn't log ${failed.length} of them (${failed.map((f) => fmtDateShort(f.date)).join(", ")}) — try again or add manually.`);
+    lines.push(
+      "",
+      `Couldn't log ${failed.length} of them (${failed.map((f) => `${f.candidate.pharmacy_name} ${fmtDateShort(f.candidate.shift_date)}`).join(", ")}) — try again or add manually.`
+    );
   }
   lines.push("", "View at locum1st.net/shifts");
   return plain(lines.join("\n"));
@@ -776,7 +880,7 @@ export async function processMessage(
     setState(conversationId, { phase: "idle" });
   }
 
-  // ── Awaiting date selection (multi-date shift offer) ─────────────────────
+  // ── Awaiting date selection (multi-shift offer) ──────────────────────────
   if (state.phase === "awaiting_date_selection") {
     const lower = trimmed.toLowerCase();
     if (/^(none|cancel|skip)\b/.test(lower)) {
@@ -784,14 +888,14 @@ export async function processMessage(
       return plain("No shifts logged. Send another shift offer whenever you're ready.");
     }
     if (/^all\b/.test(lower)) {
-      return handleSaveShifts(conversationId, userId, state.template, state.dates);
+      return handleSaveShifts(conversationId, userId, state.candidates);
     }
-    const indices = parseDateSelection(trimmed, state.dates.length);
+    const indices = parseDateSelection(trimmed, state.candidates.length);
     if (indices) {
-      return handleSaveShifts(conversationId, userId, state.template, indices.map((i) => state.dates[i - 1]));
+      return handleSaveShifts(conversationId, userId, indices.map((i) => state.candidates[i - 1]!));
     }
     if (/\d/.test(trimmed)) {
-      return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.dates.length} (e.g. "1,3"), "all", or "none".`);
+      return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.candidates.length} (e.g. "1,3"), "all", or "none".`);
     }
     setState(conversationId, { phase: "idle" });
   }
@@ -834,17 +938,30 @@ export async function processMessage(
     return plain("I'm here to analyse shifts and log them. Forward a shift offer to get started.");
   }
 
-  const missing: string[] = [];
-  if (!ext.shift_dates?.length) missing.push("the date");
-  if (!ext.start_time) missing.push("the start time");
-  if (!ext.end_time) missing.push("the end time");
-  if (missing.length) {
-    const named = missing.length === 1
-      ? missing[0]
-      : `${missing.slice(0, -1).join(", ")} and ${missing[missing.length - 1]}`;
-    return plain(`I couldn't work out ${named} for that shift — could you fill that in?`);
+  const groups = normalizeGroups(ext);
+  if (!groups.length) {
+    // Single-pharmacy case (the common one): name exactly which field is missing,
+    // same as before groups existed. A multi-pharmacy offer with an incomplete
+    // group gets a generic message instead — rarer, and "which group" is less
+    // meaningful to surface than "which field".
+    if (!ext.groups?.length) {
+      const missing: string[] = [];
+      if (!ext.shift_dates?.length) missing.push("the date");
+      if (!ext.start_time) missing.push("the start time");
+      if (!ext.end_time) missing.push("the end time");
+      if (missing.length) {
+        const named = missing.length === 1
+          ? missing[0]
+          : `${missing.slice(0, -1).join(", ")} and ${missing[missing.length - 1]}`;
+        return plain(`I couldn't work out ${named} for that shift — could you fill that in?`);
+      }
+    }
+    return plain("I couldn't work out the date, start time and end time for that shift — could you fill that in?");
   }
 
-  console.log(`[${conversationId}] Analysing: ${ext.pharmacy_name} ${ext.shift_dates!.join(",")} ${ext.start_time}-${ext.end_time}`);
-  return handleShiftAnalysis(conversationId, userId, ext);
+  console.log(
+    `[${conversationId}] Analysing ${groups.length} group(s): ` +
+      groups.map((g) => `${g.pharmacy_name ?? "?"} ${g.shift_dates.join(",")} ${g.start_time}-${g.end_time}`).join(" | ")
+  );
+  return handleShiftAnalysis(conversationId, userId, ext, groups);
 }
