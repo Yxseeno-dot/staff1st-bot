@@ -88,7 +88,7 @@ async function handleMessage(msg: UnprocessedMessage) {
   let reply: BotReply;
   try {
     reply = await withTimeout(
-      processMessage(msg.conversation_id, msg.user_id, msg.text),
+      processMessage(msg.conversation_id, msg.user_id, msg.text, msg.id),
       45_000,
       "processMessage"
     );

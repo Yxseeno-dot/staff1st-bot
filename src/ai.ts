@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { execute } from "./db.js";
+import { execute, query } from "./db.js";
 
 // Force Node's native fetch instead of the SDK's bundled node-fetch v2, which has a
 // known intermittent ERR_STREAM_PREMATURE_CLOSE bug on gzip-compressed responses.
@@ -13,6 +13,11 @@ const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 const BEARER = process.env.BOT_API_BEARER;
 if (!BEARER) throw new Error("BOT_API_BEARER is required");
 const BASE = process.env.BOT_API_BASE ?? "https://locum1st.net/api/bot";
+
+const BOT_USER_ID = process.env.BOT_USER_ID;
+if (!BOT_USER_ID) throw new Error("BOT_USER_ID is required");
+
+const HISTORY_LIMIT = 5;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -157,7 +162,27 @@ type ShiftExtraction = {
   pmr_system?: string | null;
 };
 
-async function extractShift(text: string): Promise<ShiftExtraction> {
+type HistoryTurn = { role: "user" | "assistant"; content: string };
+
+// Last few messages in the conversation (either side), oldest first — lets
+// extractShift piece together shift details split across messages ("Boots
+// Manchester" then, separately, "9-5 Tuesday, £24/hr") instead of treating
+// each incoming message as a standalone, context-free offer.
+async function fetchRecentHistory(conversationId: string, currentMessageId: string): Promise<HistoryTurn[]> {
+  const rows = await query<{ sender_id: string; text: string }>(
+    `SELECT sender_id, text FROM locum1st.messages
+     WHERE conversation_id = $1 AND id <> $2
+     ORDER BY created_at DESC
+     LIMIT $3`,
+    [conversationId, currentMessageId, HISTORY_LIMIT]
+  );
+  return rows.reverse().map((m) => ({
+    role: m.sender_id === BOT_USER_ID ? "assistant" : "user",
+    content: m.text,
+  }));
+}
+
+async function extractShift(text: string, history: HistoryTurn[]): Promise<ShiftExtraction> {
   const today = new Date().toISOString().slice(0, 10);
   const res = await client.chat.completions.create({
     model: MODEL,
@@ -167,6 +192,7 @@ async function extractShift(text: string): Promise<ShiftExtraction> {
       {
         role: "system",
         content: `Extract shift offer details from text. Return JSON.
+Recent conversation history is provided for context (e.g. shift details split across several messages, or a follow-up like "actually make it 8am") — the CURRENT message is the last one; prior ones are context only, do not re-report a shift that was already fully extracted and confirmed earlier unless the current message adds to or changes it.
 Today is ${today}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
@@ -191,6 +217,7 @@ Fields:
 - travel_allowance_fixed: number | null (a flat £ travel allowance for the whole shift, e.g. "plus £20 travel" — mutually exclusive with a per-mile rate; leave mileage_paid false and mileage_pence_per_mile null when this is set)
 - pmr_system: string | null — ONLY set this if the text explicitly names the pharmacy's PMR (patient medication record) system, e.g. "EMIS", "ProScript Connect", "Titan", "Pharmacy Manager", "Positive Solutions", "Nexphase". Normalise obvious spelling/case variants to the common name. Do not guess — leave null if it isn't mentioned.`,
       },
+      ...history,
       { role: "user", content: text },
     ],
   });
@@ -719,7 +746,8 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
 export async function processMessage(
   conversationId: string,
   userId: string,
-  text: string
+  text: string,
+  messageId: string
 ): Promise<BotReply> {
   const state = getState(conversationId);
   const trimmed = text.trim();
@@ -799,7 +827,8 @@ export async function processMessage(
   }
 
   // ── Extract shift offer ─────────────────────────────────────────────────
-  const ext = await extractShift(text);
+  const history = await fetchRecentHistory(conversationId, messageId);
+  const ext = await extractShift(text, history);
 
   if (!ext.is_shift_offer) {
     return plain("I'm here to analyse shifts and log them. Forward a shift offer to get started.");
