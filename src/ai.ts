@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { execute } from "./db.js";
 
 // Force Node's native fetch instead of the SDK's bundled node-fetch v2, which has a
 // known intermittent ERR_STREAM_PREMATURE_CLOSE bug on gzip-compressed responses.
@@ -153,6 +154,7 @@ type ShiftExtraction = {
   mileage_threshold_miles?: number | null;
   mileage_cap_miles?: number | null;
   travel_allowance_fixed?: number | null;
+  pmr_system?: string | null;
 };
 
 async function extractShift(text: string): Promise<ShiftExtraction> {
@@ -186,7 +188,8 @@ Fields:
 - mileage_pence_per_mile: number | null (only set when there's a per-mile rate)
 - mileage_threshold_miles: number | null (miles each way the locum covers themselves before per-mile reimbursement starts)
 - mileage_cap_miles: number | null (miles each way beyond which the pharmacy stops reimbursing per-mile travel, e.g. "up to 30 miles") — only relevant with a per-mile rate
-- travel_allowance_fixed: number | null (a flat £ travel allowance for the whole shift, e.g. "plus £20 travel" — mutually exclusive with a per-mile rate; leave mileage_paid false and mileage_pence_per_mile null when this is set)`,
+- travel_allowance_fixed: number | null (a flat £ travel allowance for the whole shift, e.g. "plus £20 travel" — mutually exclusive with a per-mile rate; leave mileage_paid false and mileage_pence_per_mile null when this is set)
+- pmr_system: string | null — ONLY set this if the text explicitly names the pharmacy's PMR (patient medication record) system, e.g. "EMIS", "ProScript Connect", "Titan", "Pharmacy Manager", "Positive Solutions", "Nexphase". Normalise obvious spelling/case variants to the common name. Do not guess — leave null if it isn't mentioned.`,
       },
       { role: "user", content: text },
     ],
@@ -200,33 +203,67 @@ Fields:
 
 // ─── Rate & verdict logic ─────────────────────────────────────────────────────
 
-function recommendedRate(avgItems: number, shiftType: string): number {
-  let base: number;
-  if (avgItems > 8000) base = 28;
-  else if (avgItems > 6000) base = 26;
-  else if (avgItems > 3500) base = 24;
-  else base = 22;
-  if (shiftType === "bank_holiday") base += 4;
-  else if (shiftType === "overnight") base += 3;
-  return base;
+// Area-based benchmark from Locum1st's /market-rate endpoint (crowd-sourced
+// postings in shared.market_shift_postings, matched on area + workload tier +
+// bank-holiday/same-day-emergency category). Falls back to a flat default
+// when the endpoint itself has too little data, and to the same default here
+// if the call fails outright — never falls back to a single pharmacy's history.
+type MarketRate = {
+  benchmarkRate: number;
+  sampleSize: number;
+  source: "area_tier_match" | "area_relaxed_tier" | "default_fallback";
+  tier: "busy" | "moderate" | "quieter" | null;
+  isBankHoliday: boolean;
+  isSameDayEmergency: boolean;
+};
+
+function tierOf(avgItems: number | null): "busy" | "moderate" | "quieter" | null {
+  if (avgItems == null) return null;
+  if (avgItems > 8000) return "busy";
+  if (avgItems > 4000) return "moderate";
+  return "quieter";
 }
 
-function verdict(rate: number, avgItems: number, shiftType: string): string {
-  const rec = recommendedRate(avgItems, shiftType);
-  if (rate >= rec + 1) return "Worth taking";
-  if (rate >= rec - 1) return "Fair rate";
-  if (rate >= rec - 3) return "Consider carefully";
+async function fetchMarketRate(
+  postcode: string | undefined,
+  area: string | undefined,
+  date: string,
+  avgItems: number | null
+): Promise<MarketRate> {
+  const params = new URLSearchParams({ date });
+  if (postcode) params.set("postcode", postcode);
+  if (area) params.set("area", area);
+  if (avgItems != null) params.set("items", String(avgItems));
+  try {
+    return await botFetch<MarketRate>(`/market-rate?${params}`);
+  } catch (err) {
+    console.error("Market rate lookup failed, using flat fallback:", err);
+    const tier = tierOf(avgItems);
+    return {
+      benchmarkRate: tier === "busy" ? 30 : 28,
+      sampleSize: 0,
+      source: "default_fallback",
+      tier,
+      isBankHoliday: false,
+      isSameDayEmergency: false,
+    };
+  }
+}
+
+function verdict(rate: number, benchmark: number): string {
+  if (rate >= benchmark + 1) return "Worth taking";
+  if (rate >= benchmark - 1) return "Fair rate";
+  if (rate >= benchmark - 3) return "Consider carefully";
   return "Below market rate";
 }
 
-function verdictReason(rate: number, avgItems: number, shiftType: string): string {
-  const rec = recommendedRate(avgItems, shiftType);
-  const busy = avgItems > 8000 ? "busy" : avgItems > 4000 ? "moderate" : "quieter";
-  const diff = rate - rec;
-  if (diff >= 1) return `${busy.charAt(0).toUpperCase() + busy.slice(1)} pharmacy paying above market for its workload.`;
-  if (diff >= -1) return `Rate matches the expected range for a ${busy} pharmacy like this.`;
-  if (diff >= -3) return `Rate is a little low for a ${busy} pharmacy (market ~£${rec}/hr). Negotiate if you can.`;
-  return `Rate is well below market for this workload. Market rate here is ~£${rec}/hr.`;
+function verdictReason(rate: number, benchmark: number, tier: "busy" | "moderate" | "quieter" | null): string {
+  const forTier = tier ? ` for a ${tier} pharmacy` : "";
+  const diff = rate - benchmark;
+  if (diff >= 1) return `Paying above the area's market rate${forTier}.`;
+  if (diff >= -1) return `Rate matches the area's market rate${forTier}.`;
+  if (diff >= -3) return `Rate is a little low${forTier} (market ~£${benchmark}/hr). Negotiate if you can.`;
+  return `Rate is well below market${forTier}. Market rate here is ~£${benchmark}/hr.`;
 }
 
 // ─── Date helpers ─────────────────────────────────────────────────────────────
@@ -296,6 +333,30 @@ function paidHours(rawHours: number, breakMinutes: number, breakPaid: boolean): 
   return breakPaid ? rawHours : rawHours - breakMinutes / 60;
 }
 
+// Best-effort, fire-and-forget: appends one row to the crowd-sourced
+// pharmacy/ODS/PMR observation log (shared.pharmacy_pmr_observations,
+// Locum1st's instrumentation.ts) whenever a forwarded shift offer names a
+// PMR system — regardless of whether the locum goes on to log the shift.
+// Purely a background data asset for future use; must never affect the
+// analysis reply, so failures are only logged, never thrown.
+function logPmrObservation(
+  conversationId: string,
+  userId: string,
+  pharmacyName: string,
+  odsCode: string | undefined,
+  pharmacyAddress: string | undefined,
+  pmrSystem: string
+): void {
+  execute(
+    `INSERT INTO shared.pharmacy_pmr_observations
+       (pharmacy_name, ods_code, pmr_system, pharmacy_address, reported_by_auth_user_id, conversation_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [pharmacyName, odsCode ?? null, pmrSystem, pharmacyAddress ?? null, userId, conversationId]
+  ).catch((err) => {
+    console.error(`[${conversationId}] Failed to log PMR observation:`, err);
+  });
+}
+
 // ─── Sub-handlers ─────────────────────────────────────────────────────────────
 
 async function handleShiftAnalysis(
@@ -316,6 +377,18 @@ async function handleShiftAnalysis(
       `/pharmacy?q=${encodeURIComponent(searchQuery)}`
     );
     match = pharmacyData.results?.[0];
+  }
+
+  const pharmacyNameForLog = match?.name ?? ext.pharmacy_name;
+  if (ext.pmr_system && pharmacyNameForLog) {
+    logPmrObservation(
+      conversationId,
+      userId,
+      pharmacyNameForLog,
+      match?.odsCode,
+      match?.address ?? ext.pharmacy_address,
+      ext.pmr_system
+    );
   }
 
   type HistoryMonth = { items: number; pharmacyFirstTotal: number; nms: number; bpChecks: number };
@@ -356,8 +429,19 @@ async function handleShiftAnalysis(
   const breakPaid = ext.break_paid ?? false;
   const hours = paidHours(rawHours, breakMinutes, breakPaid);
   const shiftType = ext.shift_type ?? "standard";
+
+  const market = await fetchMarketRate(
+    ext.pharmacy_postcode,
+    match?.address ?? ext.pharmacy_address,
+    ext.shift_dates![0]!,
+    avgItems
+  );
+  // Market comparison doesn't classify by overnight (only area/tier/bank-holiday/
+  // same-day-emergency), so that bump still applies on top of the benchmark.
+  const benchmark = market.benchmarkRate + (shiftType === "overnight" ? 3 : 0);
+
   const rateProvided = ext.hourly_rate != null;
-  const rate = ext.hourly_rate ?? recommendedRate(avgItems ?? 3000, shiftType);
+  const rate = ext.hourly_rate ?? benchmark;
   const totalPay = (rate * hours).toFixed(0);
 
   const template: ShiftTemplate = {
@@ -423,15 +507,20 @@ async function handleShiftAnalysis(
 
   lines.push("");
 
-  if (rateProvided && avgItems != null) {
-    lines.push(`**VERDICT:** ${verdict(rate, avgItems, shiftType)}`);
-    lines.push(verdictReason(rate, avgItems, shiftType));
-  } else if (!rateProvided && avgItems != null) {
-    lines.push(`**RATE SUGGESTION:** £${recommendedRate(avgItems, shiftType)}/hr`);
-    lines.push(`Based on ${avgItems.toLocaleString()} items/month avg. Counter at or above this rate.`);
-  } else if (rateProvided) {
-    lines.push(`**VERDICT:** ${verdict(rate, 3000, shiftType)} (no workload data — rate only)`);
-    lines.push(`Market rate for a standard pharmacy is around £${recommendedRate(3000, shiftType)}/hr.`);
+  const marketNote = market.sampleSize > 0
+    ? ` (based on ${market.sampleSize} comparable posting${market.sampleSize === 1 ? "" : "s"} in the area)`
+    : "";
+
+  if (rateProvided) {
+    lines.push(`**VERDICT:** ${verdict(rate, benchmark)}`);
+    lines.push(verdictReason(rate, benchmark, market.tier) + marketNote);
+  } else {
+    lines.push(`**RATE SUGGESTION:** £${benchmark}/hr${marketNote}`);
+    lines.push(
+      avgItems != null
+        ? `Based on ${avgItems.toLocaleString()} items/month avg and nearby market postings. Counter at or above this rate.`
+        : `Based on nearby market postings. Counter at or above this rate.`
+    );
   }
 
   lines.push("");
