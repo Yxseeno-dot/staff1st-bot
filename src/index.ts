@@ -74,6 +74,25 @@ async function publish(channel: string, data: unknown): Promise<void> {
   }
 }
 
+// The bot's actual reply is only ever pushed live once — unlike the typing
+// ping (best-effort, repeated every 3s, failures silently dropped), a single
+// failed publish here means the reply sits in the DB but is never delivered
+// live; the message is already marked processed by the time this runs, so
+// nothing retries it later. Retry a few times before giving up so a
+// transient Centrifugo/network blip doesn't silently strand a reply.
+async function publishWithRetry(channel: string, data: unknown, attempts = 3): Promise<void> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await publish(channel, data);
+      return;
+    } catch (err) {
+      if (i === attempts) throw err;
+      console.error(`[publish] Attempt ${i}/${attempts} failed, retrying:`, err);
+      await sleep(500 * i);
+    }
+  }
+}
+
 async function handleMessage(msg: UnprocessedMessage) {
   console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] ${msg.user_id}: ${msg.text.slice(0, 100)}`);
 
@@ -124,7 +143,7 @@ async function handleMessage(msg: UnprocessedMessage) {
   // duplicate reply on the next poll. The client re-fetches messages on reconnect.
   await execute(`UPDATE locum1st.messages SET bot_processed = true WHERE id = $1`, [msg.id]);
 
-  await publish(channel, {
+  await publishWithRetry(channel, {
     conversation_id: msg.conversation_id,
     sender_id: BOT_USER_ID,
     text: reply.text,
