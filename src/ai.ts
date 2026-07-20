@@ -166,8 +166,16 @@ type ShiftGroup = {
   end_time: string;
 };
 
+// Classifies what the current message wants — replaces the old regex-based
+// pre-checks (cancel/show/greeting), which were brittle against free-form
+// phrasing and could false-positive on a shift offer that merely mentions
+// "cancelled"/"shift" together (e.g. "previous rota cancelled, new shift
+// below"). The model has full conversation history to work with, which the
+// regexes never did.
+type Intent = "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other";
+
 type ShiftExtraction = {
-  is_shift_offer: boolean;
+  intent: Intent;
   // Set when the message offers shifts at more than one distinct pharmacy —
   // each with its own dates/times. When absent, the top-level
   // pharmacy_name/shift_dates/start_time/end_time fields below describe the
@@ -268,8 +276,15 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
     messages: [
       {
         role: "system",
-        content: `Extract shift offer details from text. Return JSON.
+        content: `You're the message handler for a locum pharmacist's shift-tracking bot. Classify the CURRENT message's intent and, if it's a shift offer, extract its details. Return JSON.
 Recent conversation history is provided for context (e.g. shift details split across several messages, or a follow-up like "actually make it 8am") — the CURRENT message is the last one; prior ones are context only, do not re-report a shift that was already fully extracted and confirmed earlier unless the current message adds to or changes it.
+First decide "intent" — one of:
+- "shift_offer": the message is offering, describing, or forwarding one or more concrete shifts at a pharmacy — a broadcast, a rota, or a single shift. This includes messages that also happen to mention words like "cancelled" or "removed" in passing (e.g. "previous rota cancelled, new shift below") — that's still a shift offer, not a cancel request.
+- "cancel_shift": the sender (the locum) wants to cancel/delete/remove a shift THEY have already logged with Locum1st — not a shift offer describing some other change.
+- "show_shifts": the sender wants to see their own logged/upcoming shifts.
+- "greeting": a greeting, or a general "what can you do"/help question, with no specific shift or account action attached.
+- "other": anything else that doesn't fit the above — chit-chat, an unrelated question, or unclear intent.
+Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
 Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
@@ -278,7 +293,7 @@ If the SAME shift pattern (same pharmacy, times, and rate) is offered across mul
 If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names/addresses, each with its own date(s) and/or times — e.g. a multi-branch broadcast like "13 July: Prescot Road ... / 30 July: Moreton ..."), put one object per pharmacy in the "groups" array instead of using the top-level pharmacy_name/shift_dates/start_time/end_time fields — leave those top-level fields null in that case. Each group needs its own pharmacy_name/pharmacy_postcode/pharmacy_address/shift_dates/start_time/end_time. Do NOT create a group per date for a SINGLE pharmacy's rota — that's still just shift_dates on one group (or the top-level fields, if there's only one pharmacy overall).
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
-- is_shift_offer: boolean
+- intent: "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other" — see above
 - groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
 - pharmacy_name: string | null (only when NOT using groups)
 - pharmacy_postcode: string | null (only when NOT using groups)
@@ -304,7 +319,7 @@ Fields:
   try {
     return JSON.parse(res.choices[0]?.message?.content ?? "{}") as ShiftExtraction;
   } catch {
-    return { is_shift_offer: false };
+    return { intent: "other" };
   }
 }
 
@@ -947,16 +962,15 @@ export async function processMessage(
     return plain("Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.net/upgrade to use the bot.");
   }
 
-  // ── Cancel / delete shift ────────────────────────────────────────────────
-  if (
-    /\b(cancel|cancelled|cancelling|delete|deleted|remove|removed)\b/i.test(trimmed) &&
-    /\bshift\b/i.test(trimmed)
-  ) {
+  // ── Classify intent and, if relevant, extract the shift offer ───────────
+  const history = await fetchRecentHistory(conversationId, messageId);
+  const ext = await extractShift(text, history);
+
+  if (ext.intent === "cancel_shift") {
     return handleListShiftsForDelete(conversationId, userId);
   }
 
-  // ── Show shifts ─────────────────────────────────────────────────────────
-  if (/\b(show|list|my)\b.*\bshift(s)?\b/i.test(trimmed)) {
+  if (ext.intent === "show_shifts") {
     const data = await botFetch<{ shifts?: Shift[] }>(`/shifts?auth_user_id=${encodeURIComponent(userId)}`);
     if (!data.shifts?.length) return plain("You have no recent shifts logged.");
     return plain(data.shifts
@@ -964,16 +978,11 @@ export async function processMessage(
       .join("\n"));
   }
 
-  // ── Greeting ────────────────────────────────────────────────────────────
-  if (/^(hi|hello|hey|help|what can you|what do you)\b/i.test(trimmed.toLowerCase()) && trimmed.length < 40) {
+  if (ext.intent === "greeting") {
     return plain("Send me a shift offer and I'll analyse it:\n\n**Rate** vs workload\n**Driving distance** from your home\n**Verdict** on whether the pay is fair\n\nThen log it to your shifts if you want to accept it.");
   }
 
-  // ── Extract shift offer ─────────────────────────────────────────────────
-  const history = await fetchRecentHistory(conversationId, messageId);
-  const ext = await extractShift(text, history);
-
-  if (!ext.is_shift_offer) {
+  if (ext.intent !== "shift_offer") {
     return plain("I'm here to analyse shifts and log them. Forward a shift offer to get started.");
   }
 
