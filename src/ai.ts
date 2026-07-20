@@ -427,6 +427,20 @@ function parseDateSelection(input: string, max: number): number[] | null {
   return indices.size ? Array.from(indices).sort((a, b) => a - b) : null;
 }
 
+// True only for text that actually looks like an attempted (if invalid) list
+// reply — short, and nothing but digits/commas/hyphens/whitespace once "and"
+// and ordinal suffixes are stripped. A freshly forwarded shift offer also
+// contains digits (times, dates, rate) but is much longer and full of
+// letters, so it won't match — it should fall through to fresh extraction
+// instead of being misread as a bad reply to a stale prompt.
+function looksLikeFailedSelection(input: string): boolean {
+  if (input.length > 40) return false;
+  const stripped = input
+    .replace(/\b(and|the)\b/gi, ",")
+    .replace(/(st|nd|rd|th)\b/gi, "");
+  return /\d/.test(stripped) && /^[\d,\-\s]+$/.test(stripped);
+}
+
 function hoursDecimal(start: string, end: string): number {
   const [sh, sm] = start.split(":").map(Number);
   const [eh, em] = end.split(":").map(Number);
@@ -919,7 +933,7 @@ export async function processMessage(
     if (indices) {
       return handleSaveShifts(conversationId, userId, indices.map((i) => state.candidates[i - 1]!));
     }
-    if (/\d/.test(trimmed)) {
+    if (looksLikeFailedSelection(trimmed)) {
       return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.candidates.length} (e.g. "1,3"), "all", or "none".`);
     }
     setState(conversationId, { phase: "idle" });
