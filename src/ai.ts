@@ -191,11 +191,27 @@ type ShiftExtraction = {
   pmr_system?: string | null;
 };
 
+// The LLM is asked to resolve a day+month with no year ("14 June") against
+// "today", but it frequently just echoes the current year even when that
+// date has already passed — offering a shift that already happened. Rather
+// than rely on prompt wording alone, roll any such date forward by whole
+// years until it's on or after today; a shift *offer* can never legitimately
+// be in the past, so this is safe regardless of why the model got it wrong.
+function rollDateForward(dateStr: string, today: string): string {
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return dateStr;
+  let year = parseInt(m[1]!, 10);
+  const monthDay = `${m[2]}-${m[3]}`;
+  while (`${year}-${monthDay}` < today) year++;
+  return `${year}-${monthDay}`;
+}
+
 // Resolves the message into one or more pharmacy groups, each with concrete
 // dates/times — either the LLM's own `groups` (multi-pharmacy offer) or a
 // single group built from the legacy flat fields (the common case). Drops
 // any group missing dates/start/end rather than failing the whole message.
 function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
+  const today = new Date().toISOString().slice(0, 10);
   const raw: ShiftGroupRaw[] = ext.groups?.length
     ? ext.groups
     : [{
@@ -214,7 +230,7 @@ function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
       pharmacy_name: g.pharmacy_name ?? undefined,
       pharmacy_postcode: g.pharmacy_postcode ?? undefined,
       pharmacy_address: g.pharmacy_address ?? undefined,
-      shift_dates: g.shift_dates,
+      shift_dates: g.shift_dates.map((d) => rollDateForward(d, today)),
       start_time: g.start_time,
       end_time: g.end_time,
     });
@@ -244,6 +260,7 @@ async function fetchRecentHistory(conversationId: string, currentMessageId: stri
 
 async function extractShift(text: string, history: HistoryTurn[]): Promise<ShiftExtraction> {
   const today = new Date().toISOString().slice(0, 10);
+  const todayWeekday = new Date(`${today}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long" });
   const res = await client.chat.completions.create({
     model: MODEL,
     response_format: { type: "json_object" },
@@ -253,7 +270,7 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
         role: "system",
         content: `Extract shift offer details from text. Return JSON.
 Recent conversation history is provided for context (e.g. shift details split across several messages, or a follow-up like "actually make it 8am") — the CURRENT message is the last one; prior ones are context only, do not re-report a shift that was already fully extracted and confirmed earlier unless the current message adds to or changes it.
-Today is ${today}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form.
+Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
 If end_time would be earlier than start_time, that's an overnight shift spanning into the next day — extract the times as given rather than treating them as invalid.
@@ -469,10 +486,14 @@ async function analyzeGroup(
 
   let match: { odsCode: string; name: string; address: string } | undefined;
   if (searchQuery) {
-    const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> }>(
-      `/pharmacy?q=${encodeURIComponent(searchQuery)}`
-    );
-    match = pharmacyData.results?.[0];
+    try {
+      const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> }>(
+        `/pharmacy?q=${encodeURIComponent(searchQuery)}`
+      );
+      match = pharmacyData.results?.[0];
+    } catch (err) {
+      console.error(`[${conversationId}] Pharmacy lookup failed for "${searchQuery}":`, err);
+    }
   }
 
   const pharmacyNameForLog = match?.name ?? group.pharmacy_name;
@@ -491,7 +512,11 @@ async function analyzeGroup(
   type HistoryData = { months?: HistoryMonth[] };
   let history: HistoryData = {};
   if (match?.odsCode) {
-    history = await botFetch<HistoryData>(`/pharmacy/history?ods=${match.odsCode}`);
+    try {
+      history = await botFetch<HistoryData>(`/pharmacy/history?ods=${match.odsCode}`);
+    } catch (err) {
+      console.error(`[${conversationId}] Pharmacy history lookup failed for ODS ${match.odsCode}:`, err);
+    }
   }
 
   const months = (history.months ?? []).slice(0, 6);
