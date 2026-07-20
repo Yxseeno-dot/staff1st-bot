@@ -516,10 +516,12 @@ async function analyzeGroup(
   let match: { odsCode: string; name: string; address: string } | undefined;
   if (searchQuery) {
     try {
-      const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> }>(
+      // Locum1st's route always responds with a { results } shape now, but
+      // stay null-safe here too rather than depending on that alone.
+      const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> } | null>(
         `/pharmacy?q=${encodeURIComponent(searchQuery)}`
       );
-      match = pharmacyData.results?.[0];
+      match = pharmacyData?.results?.[0];
     } catch (err) {
       console.error(`[${conversationId}] Pharmacy lookup failed for "${searchQuery}":`, err);
     }
@@ -542,7 +544,13 @@ async function analyzeGroup(
   let history: HistoryData = {};
   if (match?.odsCode) {
     try {
-      history = await botFetch<HistoryData>(`/pharmacy/history?ods=${match.odsCode}`);
+      // data1st has no record at all for plenty of pharmacies — Locum1st's
+      // route responds with { months: [] } for that (a normal outcome, not
+      // a failure), but stay null-safe here too rather than depending on
+      // that alone; a bare `history.months` on a null response would throw
+      // and take down the whole analysis instead of just showing "no data".
+      const data = await botFetch<HistoryData | null>(`/pharmacy/history?ods=${match.odsCode}`);
+      history = data ?? {};
     } catch (err) {
       console.error(`[${conversationId}] Pharmacy history lookup failed for ODS ${match.odsCode}:`, err);
     }
@@ -651,7 +659,7 @@ async function analyzeGroup(
     lines.push(`NMS: ~${(avgNms ?? 0).toLocaleString()}/month`);
     lines.push(`BP Checks: ~${(avgBp ?? 0).toLocaleString()}/month`);
   } else {
-    lines.push("**WORKLOAD:** No Data1st data available for this pharmacy.");
+    lines.push("**WORKLOAD:** No dispensing data available for this pharmacy yet — can't estimate typical volume here.");
   }
 
   lines.push("");
