@@ -346,23 +346,46 @@ function tierOf(avgItems: number | null): "busy" | "moderate" | "quieter" | null
   return "quieter";
 }
 
+// Same role_type values as locum1st.profiles.role_type. Pharmacist vs
+// technician/ACT/dispenser rates differ enormously, so every rate suggestion
+// and verdict needs to be anchored to the right one.
+const ROLE_LABELS: Record<string, string> = {
+  locum_pharmacist: "Locum Pharmacist",
+  pharmacy_technician: "Pharmacy Technician",
+  act: "Accuracy Checking Technician",
+  dispenser: "Dispenser",
+};
+
+// Mirrors the server-side default in Locum1st's /api/bot/market-rate — used
+// only when that HTTP call itself fails outright, so this local fallback
+// never gives a wildly pharmacist-shaped number to a technician/dispenser.
+const FALLBACK_RATES: Record<string, { busy: number; other: number }> = {
+  locum_pharmacist: { busy: 30, other: 28 },
+  pharmacy_technician: { busy: 18, other: 16 },
+  act: { busy: 19, other: 17 },
+  dispenser: { busy: 14, other: 12 },
+};
+
 async function fetchMarketRate(
   postcode: string | undefined,
   area: string | undefined,
   date: string,
-  avgItems: number | null
+  avgItems: number | null,
+  role: string | null
 ): Promise<MarketRate> {
   const params = new URLSearchParams({ date });
   if (postcode) params.set("postcode", postcode);
   if (area) params.set("area", area);
   if (avgItems != null) params.set("items", String(avgItems));
+  if (role) params.set("role", role);
   try {
     return await botFetch<MarketRate>(`/market-rate?${params}`);
   } catch (err) {
     console.error("Market rate lookup failed, using flat fallback:", err);
     const tier = tierOf(avgItems);
+    const rates = (role && FALLBACK_RATES[role]) || FALLBACK_RATES.locum_pharmacist!;
     return {
-      benchmarkRate: tier === "busy" ? 30 : 28,
+      benchmarkRate: tier === "busy" ? rates.busy : rates.other,
       sampleSize: 0,
       source: "default_fallback",
       tier,
@@ -504,7 +527,8 @@ async function analyzeGroup(
   conversationId: string,
   userId: string,
   ext: ShiftExtraction,
-  group: ShiftGroup
+  group: ShiftGroup,
+  role: string | null
 ): Promise<{ candidates: PendingShift[]; lines: string[] }> {
   // Build the best possible search query from whatever pharmacy info is available
   const searchQuery = [
@@ -592,7 +616,8 @@ async function analyzeGroup(
     group.pharmacy_postcode,
     match?.address ?? group.pharmacy_address,
     group.shift_dates[0]!,
-    avgItems
+    avgItems,
+    role
   );
   // Market comparison doesn't classify by overnight (only area/tier/bank-holiday/
   // same-day-emergency), so that bump still applies on top of the benchmark.
@@ -621,9 +646,12 @@ async function analyzeGroup(
   const dates = group.shift_dates;
   const candidates: PendingShift[] = dates.map((d) => ({ ...template, shift_date: d }));
 
+  const roleLabel = role ? ROLE_LABELS[role] ?? role : null;
+
   const lines: string[] = [];
   lines.push(`**Pharmacy:** ${match?.name ?? group.pharmacy_name ?? "Unknown"} (${match?.odsCode ?? "ODS not found"})`);
   if (match?.address) lines.push(`**Address:** ${match.address}`);
+  if (roleLabel) lines.push(`**Role:** ${roleLabel}`);
   const hoursLabel = hours % 1 === 0 ? hours : hours.toFixed(1);
   const breakNote = breakMinutes > 0 ? ` — ${breakMinutes} min ${breakPaid ? "paid" : "unpaid"} break` : "";
   if (dates.length === 1) {
@@ -664,8 +692,9 @@ async function analyzeGroup(
 
   lines.push("");
 
+  const roleForNote = roleLabel ? `${roleLabel} ` : "";
   const marketNote = market.sampleSize > 0
-    ? ` (based on ${market.sampleSize} comparable posting${market.sampleSize === 1 ? "" : "s"} in the area)`
+    ? ` (based on ${market.sampleSize} comparable ${roleForNote}posting${market.sampleSize === 1 ? "" : "s"} in the area)`
     : "";
 
   if (rateProvided) {
@@ -724,9 +753,10 @@ async function handleShiftAnalysis(
   conversationId: string,
   userId: string,
   ext: ShiftExtraction,
-  groups: ShiftGroup[]
+  groups: ShiftGroup[],
+  role: string | null
 ): Promise<BotReply> {
-  const analyzed = await Promise.all(groups.map((group) => analyzeGroup(conversationId, userId, ext, group)));
+  const analyzed = await Promise.all(groups.map((group) => analyzeGroup(conversationId, userId, ext, group, role)));
   const candidates = analyzed.flatMap((a) => a.candidates);
 
   const lines: string[] = [];
@@ -963,12 +993,13 @@ export async function processMessage(
   }
 
   // ── Pro check ───────────────────────────────────────────────────────────
-  const userStatus = await botFetch<{ linked?: boolean; pro?: boolean }>(
+  const userStatus = await botFetch<{ linked?: boolean; pro?: boolean; role_type?: string | null }>(
     `/user?auth_user_id=${encodeURIComponent(userId)}`
   );
   if (!userStatus?.linked || !userStatus?.pro) {
     return plain("Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.net/upgrade to use the bot.");
   }
+  const role = userStatus.role_type ?? null;
 
   // ── Classify intent and, if relevant, extract the shift offer ───────────
   const history = await fetchRecentHistory(conversationId, messageId);
@@ -1019,5 +1050,5 @@ export async function processMessage(
     `[${conversationId}] Analysing ${groups.length} group(s): ` +
       groups.map((g) => `${g.pharmacy_name ?? "?"} ${g.shift_dates.join(",")} ${g.start_time}-${g.end_time}`).join(" | ")
   );
-  return handleShiftAnalysis(conversationId, userId, ext, groups);
+  return handleShiftAnalysis(conversationId, userId, ext, groups, role);
 }
