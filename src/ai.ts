@@ -197,6 +197,11 @@ type ShiftExtraction = {
   mileage_cap_miles?: number | null;
   travel_allowance_fixed?: number | null;
   pmr_system?: string | null;
+  // Plain-language summary of any open-ended "standing availability" mentioned
+  // alongside concrete dates (e.g. "regular Fridays available", no end date
+  // given) — kept separate from groups/shift_dates because there's no
+  // principled end date to expand it to; see extractShift's prompt.
+  recurring_availability?: string | null;
 };
 
 // The LLM is asked to resolve a day+month with no year ("14 June") against
@@ -272,7 +277,12 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
   const res = await client.chat.completions.create({
     model: MODEL,
     response_format: { type: "json_object" },
-    max_tokens: 400,
+    // A multi-group broadcast (several pharmacies, or one pharmacy with
+    // several one-off dates) can easily need more than a couple hundred
+    // tokens of JSON — 400 was tight enough that real broadcasts got cut off
+    // mid-string, which fails JSON.parse and silently drops to intent
+    // "other" with no explanation to the user.
+    max_tokens: 1000,
     messages: [
       {
         role: "system",
@@ -290,6 +300,7 @@ Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock"
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
 If end_time would be earlier than start_time, that's an overnight shift spanning into the next day — extract the times as given rather than treating them as invalid.
 If the SAME shift pattern (same pharmacy, times, and rate) is offered across multiple dates — a rota, a list of days ("Mon/Wed/Fri"), or a phrase like "every day next week" — include every date in shift_dates, not just the first one you see.
+Distinguish this from OPEN-ENDED standing availability with no end date — e.g. "Regular Fridays 8.30-6.15 available", "every Saturday going forward". Do NOT invent an arbitrary number of future dates for these (you have no principled way to know how many weeks the sender means, and guessing produces wrong, made-up shifts). Instead, leave those weekdays out of shift_dates/groups entirely and summarise them in "recurring_availability" instead, e.g. "Regular Fridays 08:30-18:15 and Saturdays 08:30-14:30". Only the concrete, specifically-dated shifts in the message go into shift_dates/groups.
 If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names/addresses, each with its own date(s) and/or times — e.g. a multi-branch broadcast like "13 July: Prescot Road ... / 30 July: Moreton ..."), put one object per pharmacy in the "groups" array instead of using the top-level pharmacy_name/shift_dates/start_time/end_time fields — leave those top-level fields null in that case. Each group needs its own pharmacy_name/pharmacy_postcode/pharmacy_address/shift_dates/start_time/end_time. Do NOT create a group per date for a SINGLE pharmacy's rota — that's still just shift_dates on one group (or the top-level fields, if there's only one pharmacy overall).
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
@@ -310,15 +321,22 @@ Fields:
 - mileage_threshold_miles: number | null (miles each way the locum covers themselves before per-mile reimbursement starts)
 - mileage_cap_miles: number | null (miles each way beyond which the pharmacy stops reimbursing per-mile travel, e.g. "up to 30 miles") — only relevant with a per-mile rate
 - travel_allowance_fixed: number | null (a flat £ travel allowance for the whole shift, e.g. "plus £20 travel" — mutually exclusive with a per-mile rate; leave mileage_paid false and mileage_pence_per_mile null when this is set)
-- pmr_system: string | null — ONLY set this if the text explicitly names the pharmacy's PMR (patient medication record) system, e.g. "EMIS", "ProScript Connect", "Titan", "Pharmacy Manager", "Positive Solutions", "Nexphase". Normalise obvious spelling/case variants to the common name. Do not guess — leave null if it isn't mentioned.`,
+- pmr_system: string | null — ONLY set this if the text explicitly names the pharmacy's PMR (patient medication record) system, e.g. "EMIS", "ProScript Connect", "Titan", "Pharmacy Manager", "Positive Solutions", "Nexphase". Normalise obvious spelling/case variants to the common name. Do not guess — leave null if it isn't mentioned.
+- recurring_availability: string | null — see above; a short human-readable note about any open-ended standing availability, only when the message mentions one. Leave null otherwise.`,
       },
       ...history,
       { role: "user", content: text },
     ],
   });
+  const choice = res.choices[0];
   try {
-    return JSON.parse(res.choices[0]?.message?.content ?? "{}") as ShiftExtraction;
-  } catch {
+    return JSON.parse(choice?.message?.content ?? "{}") as ShiftExtraction;
+  } catch (err) {
+    console.error(
+      `Failed to parse shift extraction JSON (finish_reason=${choice?.finish_reason}):`,
+      err,
+      choice?.message?.content
+    );
     return { intent: "other" };
   }
 }
@@ -344,6 +362,16 @@ function tierOf(avgItems: number | null): "busy" | "moderate" | "quieter" | null
   if (avgItems > 8000) return "busy";
   if (avgItems > 4000) return "moderate";
   return "quieter";
+}
+
+// locum1st.verification_roles has a separate 'pharmacist' key (an employed,
+// non-locum pharmacist) alongside 'locum_pharmacist' — but any shift someone
+// forwards to this bot is by definition locum work, regardless of which of
+// those two the sender's profile says, so fold 'pharmacist' into
+// 'locum_pharmacist' for every rate/benchmark/display purpose below. Other
+// roles (dispenser, technician, ACT) already map to themselves.
+function normalizeRole(role: string | null): string | null {
+  return role === "pharmacist" ? "locum_pharmacist" : role;
 }
 
 // Same role_type values as locum1st.profiles.role_type. Pharmacist vs
@@ -770,6 +798,10 @@ async function handleShiftAnalysis(
     });
   }
 
+  if (ext.recurring_availability) {
+    lines.push("", `**Also noted:** ${ext.recurring_availability} — send a specific date when one comes up and I'll analyse it.`);
+  }
+
   if (candidates.length === 1) {
     setState(conversationId, { phase: "awaiting_confirmation", pending: candidates[0]! });
     return confirmShift(lines.join("\n"));
@@ -999,7 +1031,7 @@ export async function processMessage(
   if (!userStatus?.linked || !userStatus?.pro) {
     return plain("Shift analysis is a Locum1st Pro feature. Upgrade to Pro at locum1st.net/upgrade to use the bot.");
   }
-  const role = userStatus.role_type ?? null;
+  const role = normalizeRole(userStatus.role_type ?? null);
 
   // ── Classify intent and, if relevant, extract the shift offer ───────────
   const history = await fetchRecentHistory(conversationId, messageId);
@@ -1027,6 +1059,12 @@ export async function processMessage(
 
   const groups = normalizeGroups(ext);
   if (!groups.length) {
+    // A message can be nothing but open-ended standing availability ("Regular
+    // Fridays available") with no concrete dates at all — that's not a
+    // missing-field error, there's just nothing bookable to analyse yet.
+    if (ext.recurring_availability) {
+      return plain(`Noted: ${ext.recurring_availability}. Send me a specific date when one comes up and I'll analyse it.`);
+    }
     // Single-pharmacy case (the common one): name exactly which field is missing,
     // same as before groups existed. A multi-pharmacy offer with an incomplete
     // group gets a generic message instead — rarer, and "which group" is less
