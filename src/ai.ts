@@ -52,6 +52,8 @@ type ShiftTemplate = {
 
 type PendingShift = ShiftTemplate & { shift_date: string };
 
+type PharmacyCandidate = { odsCode: string; name: string; address: string };
+
 type Shift = {
   id: string;
   pharmacy_name: string;
@@ -69,7 +71,20 @@ type State =
   // Flat list rather than one shared template + dates — covers both a single
   // pharmacy offered on several dates AND a multi-pharmacy broadcast, since
   // each candidate is already a fully-resolved shift in its own right.
-  | { phase: "awaiting_date_selection"; candidates: PendingShift[] };
+  | { phase: "awaiting_date_selection"; candidates: PendingShift[] }
+  // A postcode search for one group in the message came back with more than
+  // one pharmacy and none was a confident name match — `resolved` carries
+  // the matches already settled for earlier groups (undefined where a group
+  // genuinely had no ODS hit) so handleShiftAnalysis can resume from where
+  // it paused instead of re-querying groups that were already unambiguous.
+  | {
+      phase: "awaiting_pharmacy_selection";
+      ext: ShiftExtraction;
+      groups: ShiftGroup[];
+      role: string | null;
+      resolved: (PharmacyCandidate | undefined)[];
+      candidates: PharmacyCandidate[];
+    };
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
@@ -106,6 +121,9 @@ function selectDelete(text: string, shifts: Array<{ name: string; date: string }
 }
 function selectDates(text: string, dates: string[]): BotReply {
   return { text, metadata: { action: "select_dates", dates: dates as unknown as JsonVal } };
+}
+function selectPharmacy(text: string, candidates: Array<{ name: string; address: string }>): BotReply {
+  return { text, metadata: { action: "select_pharmacy", candidates: candidates as unknown as JsonVal } };
 }
 
 const BOT_FETCH_TIMEOUT_MS = 15_000;
@@ -204,19 +222,42 @@ type ShiftExtraction = {
   recurring_availability?: string | null;
 };
 
-// The LLM is asked to resolve a day+month with no year ("14 June") against
-// "today", but it frequently just echoes the current year even when that
-// date has already passed — offering a shift that already happened. Rather
-// than rely on prompt wording alone, roll any such date forward by whole
-// years until it's on or after today; a shift *offer* can never legitimately
-// be in the past, so this is safe regardless of why the model got it wrong.
-function rollDateForward(dateStr: string, today: string): string {
+// Number of whole years dateStr's year needs to advance by to land on or
+// after `today` (both YYYY-MM-DD) — 0 if it's already on/after today.
+function yearsToRollForward(dateStr: string, today: string): number {
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return dateStr;
+  if (!m) return 0;
   let year = parseInt(m[1]!, 10);
   const monthDay = `${m[2]}-${m[3]}`;
-  while (`${year}-${monthDay}` < today) year++;
-  return `${year}-${monthDay}`;
+  let years = 0;
+  while (`${year}-${monthDay}` < today) {
+    year++;
+    years++;
+  }
+  return years;
+}
+
+function addYears(dateStr: string, years: number): string {
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m || years === 0) return dateStr;
+  return `${parseInt(m[1]!, 10) + years}-${m[2]}-${m[3]}`;
+}
+
+// The LLM is asked to resolve a day+month with no year ("14 June") against
+// "today", but it frequently just echoes the current year even when that
+// date has already passed — offering a shift that already happened. Correct
+// for that by rolling every date in the SAME group forward by the same
+// number of years, but only when every date in the group is in the past. If
+// even one sibling date in the same rota is already on/after today, the
+// group is already anchored to the right year, and a date just a little
+// behind it (e.g. "yesterday" in a rota that also covers today — an offer
+// forwarded a day late) isn't evidence of a stale-year echo, so leave it
+// alone rather than rolling that one date a full year ahead of its siblings.
+function rollGroupDatesForward(dates: string[], today: string): string[] {
+  const deltas = dates.map((d) => yearsToRollForward(d, today));
+  if (deltas.some((delta) => delta === 0)) return dates;
+  const maxDelta = Math.max(...deltas);
+  return dates.map((d) => addYears(d, maxDelta));
 }
 
 // Resolves the message into one or more pharmacy groups, each with concrete
@@ -243,7 +284,7 @@ function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
       pharmacy_name: g.pharmacy_name ?? undefined,
       pharmacy_postcode: g.pharmacy_postcode ?? undefined,
       pharmacy_address: g.pharmacy_address ?? undefined,
-      shift_dates: g.shift_dates.map((d) => rollDateForward(d, today)),
+      shift_dates: rollGroupDatesForward(g.shift_dates, today),
       start_time: g.start_time,
       end_time: g.end_time,
     });
@@ -544,41 +585,108 @@ function logPmrObservation(
   });
 }
 
+// ─── Pharmacy resolution ────────────────────────────────────────────────────
+
+function normalizeForMatch(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Loose match between an ODS-registered name and the (often informal) name
+// given in a shift offer — e.g. "K's Chemist" vs a formal ODS name like "K S
+// CHEMIST LTD" — used only to auto-resolve an otherwise-ambiguous multi-hit
+// postcode search. Deliberately conservative (a substring check on fully
+// punctuation/space-stripped text, gated on a minimum length) since a false
+// positive here means silently picking the wrong pharmacy; anything that
+// doesn't clear this bar falls through to asking the user directly.
+function isCloseNameMatch(candidateName: string, offeredName: string): boolean {
+  const a = normalizeForMatch(candidateName);
+  const b = normalizeForMatch(offeredName);
+  return a.length >= 4 && b.length >= 4 && (a.includes(b) || b.includes(a));
+}
+
+type PharmacyResolution =
+  | { status: "matched"; match: PharmacyCandidate }
+  | { status: "not_found" }
+  | { status: "ambiguous"; candidates: PharmacyCandidate[] };
+
+// Looks up the pharmacy for one group. Sends the pharmacy name and its
+// area/postcode as SEPARATE params rather than pre-joined into one string —
+// Locum1st's /pharmacy route has two fallback tiers beyond the
+// combined-string search (name-only, then per-significant-word), but both
+// are gated on receiving a distinct `name` param (it can't safely undo a
+// join to try the name alone, since a pharmacy's formal name can itself
+// contain a place name). When the postcode/name search comes back with more
+// than one hit and none is a close match to the offered name, this reports
+// "ambiguous" instead of guessing — the caller decides whether to ask the
+// user or fall back to unmatched.
+async function resolvePharmacy(conversationId: string, group: ShiftGroup): Promise<PharmacyResolution> {
+  const pharmacyName = group.pharmacy_name?.trim() || undefined;
+  const pharmacyArea = [group.pharmacy_postcode, group.pharmacy_address].filter(Boolean).join(" ").trim() || undefined;
+  if (!pharmacyName && !pharmacyArea) return { status: "not_found" };
+
+  const params = new URLSearchParams();
+  if (pharmacyName) {
+    params.set("name", pharmacyName);
+    if (pharmacyArea) params.set("area", pharmacyArea);
+  } else {
+    // No pharmacy name at all — only postcode/address to go on. Send as
+    // `q`, not `name`: the route's per-word fallback tier only runs when a
+    // caller sends an explicit `name`, and area/postcode text must never
+    // reach that tier — a place name inside it could false-match an
+    // unrelated pharmacy that merely shares the locality.
+    params.set("q", pharmacyArea!);
+  }
+
+  let results: PharmacyCandidate[] = [];
+  try {
+    // Locum1st's route always responds with a { results } shape now, but
+    // stay null-safe here too rather than depending on that alone.
+    const pharmacyData = await botFetch<{ results?: PharmacyCandidate[] } | null>(`/pharmacy?${params}`);
+    results = pharmacyData?.results ?? [];
+  } catch (err) {
+    console.error(`[${conversationId}] Pharmacy lookup failed for "${params}":`, err);
+    return { status: "not_found" };
+  }
+
+  if (!results.length) return { status: "not_found" };
+  if (results.length === 1) {
+    // A lone hit is NOT automatically trustworthy — Locum1st's per-word
+    // fallback tier matches on any single significant word in the offered
+    // name, and a pharmacy legitimately named after its own town (e.g.
+    // "Ashbourne Pharmacy") can pull back a same-substring but totally
+    // unrelated pharmacy elsewhere in the country (observed live: "Olive
+    // Pharmacy Ashbourne" in Keighley, matched purely on "Ashbourne", for a
+    // Derbyshire postcode). Only skip this check when there's no name to
+    // validate against at all (a pure postcode/area search).
+    const only = results[0]!;
+    if (!pharmacyName || isCloseNameMatch(only.name, pharmacyName)) {
+      return { status: "matched", match: only };
+    }
+    return { status: "ambiguous", candidates: results };
+  }
+  if (pharmacyName) {
+    const close = results.filter((r) => isCloseNameMatch(r.name, pharmacyName));
+    if (close.length === 1) return { status: "matched", match: close[0]! };
+  }
+  return { status: "ambiguous", candidates: results };
+}
+
 // ─── Sub-handlers ─────────────────────────────────────────────────────────────
 
-// Runs the full pharmacy lookup / workload / distance / market-rate / verdict
-// analysis for ONE pharmacy group. rate/break/mileage/pmr_system come from
-// `ext` (shared across every group in the message); everything pharmacy- and
-// date-specific comes from `group`. Returns one PendingShift candidate per
-// date in the group, plus the formatted summary block for that group.
+// Runs the full workload / distance / market-rate / verdict analysis for ONE
+// pharmacy group, given its already-resolved ODS match (or undefined if none
+// was found). rate/break/mileage/pmr_system come from `ext` (shared across
+// every group in the message); everything pharmacy- and date-specific comes
+// from `group`. Returns one PendingShift candidate per date in the group,
+// plus the formatted summary block for that group.
 async function analyzeGroup(
   conversationId: string,
   userId: string,
   ext: ShiftExtraction,
   group: ShiftGroup,
-  role: string | null
+  role: string | null,
+  match: PharmacyCandidate | undefined
 ): Promise<{ candidates: PendingShift[]; lines: string[] }> {
-  // Build the best possible search query from whatever pharmacy info is available
-  const searchQuery = [
-    group.pharmacy_name,
-    group.pharmacy_postcode,
-    group.pharmacy_address,
-  ].filter(Boolean).join(" ").trim();
-
-  let match: { odsCode: string; name: string; address: string } | undefined;
-  if (searchQuery) {
-    try {
-      // Locum1st's route always responds with a { results } shape now, but
-      // stay null-safe here too rather than depending on that alone.
-      const pharmacyData = await botFetch<{ results?: Array<{ odsCode: string; name: string; address: string }> } | null>(
-        `/pharmacy?q=${encodeURIComponent(searchQuery)}`
-      );
-      match = pharmacyData?.results?.[0];
-    } catch (err) {
-      console.error(`[${conversationId}] Pharmacy lookup failed for "${searchQuery}":`, err);
-    }
-  }
-
   const pharmacyNameForLog = match?.name ?? group.pharmacy_name;
   if (ext.pmr_system && pharmacyNameForLog) {
     logPmrObservation(
@@ -618,7 +726,11 @@ async function analyzeGroup(
   const avgBp = avg("bpChecks");
 
   type DistData = { oneway_miles?: number; return_miles?: number; duration_text?: string; error?: string };
-  const toAddr = match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode ?? group.pharmacy_name ?? "";
+  // Failsafe order: a confirmed ODS address is the most precise, but once
+  // there's no match, the postcode the sender actually typed geocodes far
+  // more reliably than an informal address string ("Clifton Rd, Ashbourne")
+  // on its own — so it comes before pharmacy_address here, not after.
+  const toAddr = match?.address ?? group.pharmacy_postcode ?? group.pharmacy_address ?? group.pharmacy_name ?? "";
   let dist: DistData = {};
   if (toAddr) {
     try {
@@ -773,18 +885,61 @@ async function analyzeGroup(
   return { candidates, lines };
 }
 
-// Orchestrates one or more pharmacy groups from the same message. A single
-// group renders exactly as a standalone shift always has; multiple groups
-// (a multi-branch broadcast) get numbered sub-headers and a combined
+// Orchestrates one or more pharmacy groups from the same message. Resolves
+// each group's pharmacy first (in order) before running any of the heavier
+// workload/distance/rate analysis — if a group's postcode search comes back
+// ambiguous, this pauses immediately and asks the user rather than guessing
+// or running (and discarding) analysis for groups that come after it.
+// `resolved` is the set of matches already settled for the groups at the
+// front of the list — non-empty only when resuming after the user answered
+// an ambiguous-pharmacy prompt for an earlier call on the same message.
+// A single group renders exactly as a standalone shift always has; multiple
+// groups (a multi-branch broadcast) get numbered sub-headers and a combined
 // selection list spanning every date at every pharmacy.
 async function handleShiftAnalysis(
   conversationId: string,
   userId: string,
   ext: ShiftExtraction,
   groups: ShiftGroup[],
-  role: string | null
+  role: string | null,
+  resolved: (PharmacyCandidate | undefined)[] = []
 ): Promise<BotReply> {
-  const analyzed = await Promise.all(groups.map((group) => analyzeGroup(conversationId, userId, ext, group, role)));
+  const matches: (PharmacyCandidate | undefined)[] = [...resolved];
+  for (let i = matches.length; i < groups.length; i++) {
+    const group = groups[i]!;
+    const resolution = await resolvePharmacy(conversationId, group);
+    if (resolution.status === "ambiguous") {
+      setState(conversationId, {
+        phase: "awaiting_pharmacy_selection",
+        ext,
+        groups,
+        role,
+        resolved: matches,
+        candidates: resolution.candidates,
+      });
+      const label = group.pharmacy_name ? `"${group.pharmacy_name}"` : "that pharmacy";
+      const area = group.pharmacy_postcode ?? group.pharmacy_address ?? "that area";
+      const intro = resolution.candidates.length === 1
+        ? `Found a pharmacy near ${area}, but the name doesn't look like a confident match for ${label} — is this it?`
+        : `Found ${resolution.candidates.length} pharmacies matching ${area} and couldn't tell which one you meant.`;
+      const lines = [
+        `**Which pharmacy is ${label}?**`,
+        "",
+        intro,
+        "",
+        ...resolution.candidates.map((c, idx) => `${idx + 1}. **${c.name}** — ${c.address}`),
+        "",
+        'Reply with a number, or "none" if none of these are right.',
+      ];
+      return selectPharmacy(
+        lines.join("\n"),
+        resolution.candidates.map((c) => ({ name: c.name, address: c.address }))
+      );
+    }
+    matches.push(resolution.status === "matched" ? resolution.match : undefined);
+  }
+
+  const analyzed = await Promise.all(groups.map((group, i) => analyzeGroup(conversationId, userId, ext, group, role, matches[i])));
   const candidates = analyzed.flatMap((a) => a.candidates);
 
   const lines: string[] = [];
@@ -1020,6 +1175,25 @@ export async function processMessage(
     }
     if (looksLikeFailedSelection(trimmed)) {
       return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.candidates.length} (e.g. "1,3"), "all", or "none".`);
+    }
+    setState(conversationId, { phase: "idle" });
+  }
+
+  // ── Awaiting pharmacy selection (ambiguous postcode match) ───────────────
+  if (state.phase === "awaiting_pharmacy_selection") {
+    const lower = trimmed.toLowerCase();
+    if (/^(none|neither|skip)\b/.test(lower)) {
+      return handleShiftAnalysis(conversationId, userId, state.ext, state.groups, state.role, [...state.resolved, undefined]);
+    }
+    const num = parseInt(trimmed, 10);
+    if (!isNaN(num) && num >= 1 && num <= state.candidates.length) {
+      return handleShiftAnalysis(
+        conversationId, userId, state.ext, state.groups, state.role,
+        [...state.resolved, state.candidates[num - 1]]
+      );
+    }
+    if (/^\d+$/.test(trimmed)) {
+      return plain(`That number isn't in the list. Reply with a number from 1 to ${state.candidates.length}, or "none".`);
     }
     setState(conversationId, { phase: "idle" });
   }
