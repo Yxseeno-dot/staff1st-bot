@@ -214,6 +214,15 @@ type ShiftExtraction = {
   mileage_threshold_miles?: number | null;
   mileage_cap_miles?: number | null;
   travel_allowance_fixed?: number | null;
+  // Hours of travel time paid (e.g. "plus 2hrs travel paid") — kept as raw
+  // hours rather than a pre-multiplied £ figure. The text rarely states
+  // what rate the travel hours are paid AT — "£45/hr plus 2hrs travel paid"
+  // gives the work rate and the travel hours on the same line, but that
+  // doesn't mean the travel is paid at that same £45 (it's just as often a
+  // separate/lower rate the sender didn't bother spelling out). analyzeGroup
+  // computes a figure ASSUMING the shift's own rate applies and labels it as
+  // an assumption in the reply — it must never be presented as a stated fact.
+  travel_hours_paid?: number | null;
   pmr_system?: string | null;
   // Plain-language summary of any open-ended "standing availability" mentioned
   // alongside concrete dates (e.g. "regular Fridays available", no end date
@@ -357,11 +366,13 @@ Fields:
 - shift_type: "standard" | "overnight" | "bank_holiday"
 - break_duration_minutes: number | null (length of any lunch/rest break mentioned, in minutes)
 - break_paid: boolean (true only if the text says the break IS paid; default false — most breaks are unpaid unless stated otherwise)
-- mileage_paid: boolean (true ONLY for a per-mile rate, e.g. "45p a mile" — false if travel is a flat/fixed amount)
+- mileage_paid: boolean (true ONLY for a per-mile rate, e.g. "45p a mile" — false if travel is a flat/fixed amount or paid as hours)
 - mileage_pence_per_mile: number | null (only set when there's a per-mile rate)
 - mileage_threshold_miles: number | null (miles each way the locum covers themselves before per-mile reimbursement starts)
 - mileage_cap_miles: number | null (miles each way beyond which the pharmacy stops reimbursing per-mile travel, e.g. "up to 30 miles") — only relevant with a per-mile rate
-- travel_allowance_fixed: number | null (a flat £ travel allowance for the whole shift, e.g. "plus £20 travel" — mutually exclusive with a per-mile rate; leave mileage_paid false and mileage_pence_per_mile null when this is set)
+- travel_allowance_fixed: number | null (a flat £ amount for the whole shift stated as MONEY, e.g. "plus £20 travel")
+- travel_hours_paid: number | null (travel compensated as a number of paid HOURS, e.g. "plus 2hrs travel paid", "2 hours paid travel time" — put the raw hour count here, do NOT multiply it out into a £ figure yourself, and do NOT assume it's paid at hourly_rate — the text usually doesn't say what rate applies to the travel hours, it just happens to be written on the same line as the work rate)
+These three travel fields (mileage_paid+mileage_pence_per_mile / travel_allowance_fixed / travel_hours_paid) are mutually exclusive — a shift is compensated for travel in at most ONE of these ways. Set only the one the text actually describes and leave the other two null/false. hourly_rate is ALWAYS the rate for the hours actually worked, never the travel hours, even when both numbers appear in the same sentence or line (e.g. "£45/hr plus 2hrs travel paid" — hourly_rate is 45, travel_hours_paid is 2; do not let the two figures blend into each other or apply one number to both concepts).
 - pmr_system: string | null — ONLY set this if the text explicitly names the pharmacy's PMR (patient medication record) system, e.g. "EMIS", "ProScript Connect", "Titan", "Pharmacy Manager", "Positive Solutions", "Nexphase". Normalise obvious spelling/case variants to the common name. Do not guess — leave null if it isn't mentioned.
 - recurring_availability: string | null — see above; a short human-readable note about any open-ended standing availability, only when the message mentions one. Leave null otherwise.`,
       },
@@ -767,6 +778,18 @@ async function analyzeGroup(
   const rate = ext.hourly_rate ?? benchmark;
   const totalPay = (rate * hours).toFixed(0);
 
+  // "N hrs travel paid" is compensation at the shift's OWN hourly rate, which
+  // isn't known until `rate` is resolved above (stated, or the suggested
+  // benchmark) — computed here rather than by the LLM, which had no way to
+  // know which rate would end up applying and, when tried, guessed a number
+  // that didn't match either one.
+  const travelAllowance = ext.travel_allowance_fixed ?? (ext.travel_hours_paid ? Math.round(ext.travel_hours_paid * rate) : undefined);
+  // The model has produced mileage_paid: true alongside a fixed/hours travel
+  // description with no per-mile rate — derive the persisted flag from
+  // whether a pence rate actually exists rather than trusting that boolean
+  // directly, so a mis-set flag can't misrepresent how the shift was saved.
+  const mileagePaid = ext.mileage_paid === true && ext.mileage_pence_per_mile != null;
+
   const template: ShiftTemplate = {
     pharmacy_name: match?.name ?? group.pharmacy_name ?? "Unknown",
     pharmacy_address: match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode,
@@ -777,11 +800,11 @@ async function analyzeGroup(
     shift_type: shiftType,
     break_duration_minutes: breakMinutes || undefined,
     break_paid: breakPaid,
-    mileage_paid: ext.mileage_paid ?? false,
+    mileage_paid: mileagePaid,
     mileage_pence_per_mile: ext.mileage_pence_per_mile ?? undefined,
     mileage_threshold_miles: ext.mileage_threshold_miles ?? undefined,
     mileage_cap_miles: ext.mileage_cap_miles ?? undefined,
-    travel_allowance_fixed: ext.travel_allowance_fixed ?? undefined,
+    travel_allowance_fixed: travelAllowance,
   };
   const dates = group.shift_dates;
   const candidates: PendingShift[] = dates.map((d) => ({ ...template, shift_date: d }));
@@ -851,10 +874,11 @@ async function analyzeGroup(
 
   lines.push("");
 
-  if (ext.mileage_paid && ext.mileage_pence_per_mile) {
+  if (mileagePaid) {
     // Mirrors computeMileageReimbursement() (src/lib/mileageCalc.ts) — cap is
     // applied to one-way miles before the threshold is subtracted.
-    const ppm = ext.mileage_pence_per_mile;
+    // mileagePaid already established mileage_pence_per_mile is non-null.
+    const ppm = ext.mileage_pence_per_mile!;
     const threshold = ext.mileage_threshold_miles ?? 0;
     const cap = ext.mileage_cap_miles ?? null;
     let rateDesc = `${ppm}p/mile`;
@@ -876,8 +900,15 @@ async function analyzeGroup(
         lines.push(`On this shift: journey (${dist.oneway_miles} mi) is within the ${threshold} mi threshold — no reimbursement from pharmacy on this shift.`);
       }
     }
-  } else if (ext.travel_allowance_fixed) {
-    lines.push(`**Mileage:** Fixed travel allowance of £${ext.travel_allowance_fixed} for the shift.`);
+  } else if (travelAllowance) {
+    if (ext.travel_hours_paid) {
+      // The message rarely states what rate the travel hours are paid at —
+      // this ASSUMES it's the same as the work rate, which isn't always
+      // true, so it must read as an assumption, not a fact the bot found.
+      lines.push(`**Mileage:** ${ext.travel_hours_paid} hrs paid travel — assuming your £${rate}/hr shift rate, that's £${travelAllowance} (confirm with the pharmacy if travel is paid at a different rate).`);
+    } else {
+      lines.push(`**Mileage:** Fixed travel allowance of £${travelAllowance} for the shift.`);
+    }
   } else {
     lines.push("**Mileage:** Not reimbursed by the pharmacy.");
   }
