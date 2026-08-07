@@ -52,7 +52,7 @@ type ShiftTemplate = {
 
 type PendingShift = ShiftTemplate & { shift_date: string };
 
-type PharmacyCandidate = { odsCode: string; name: string; address: string };
+type PharmacyCandidate = { odsCode: string; name: string; address: string; postcode?: string };
 
 type Shift = {
   id: string;
@@ -604,15 +604,40 @@ function normalizeForMatch(name: string): string {
 
 // Loose match between an ODS-registered name and the (often informal) name
 // given in a shift offer — e.g. "K's Chemist" vs a formal ODS name like "K S
-// CHEMIST LTD" — used only to auto-resolve an otherwise-ambiguous multi-hit
-// postcode search. Deliberately conservative (a substring check on fully
-// punctuation/space-stripped text, gated on a minimum length) since a false
-// positive here means silently picking the wrong pharmacy; anything that
-// doesn't clear this bar falls through to asking the user directly.
+// CHEMIST LTD". Deliberately permissive (a substring check on fully
+// punctuation/space-stripped text) since informal names diverge a lot from
+// formal ODS ones — but that permissiveness is exactly why it must never be
+// trusted alone: "Parkgate Pharmacy" is a legitimate substring of "Knights
+// Parkgate Pharmacy", an unrelated pharmacy 200 miles away in Pontypridd
+// that just happens to share a place-name word. isPlausibleMatch below
+// pairs this with a location check for that reason.
 function isCloseNameMatch(candidateName: string, offeredName: string): boolean {
   const a = normalizeForMatch(candidateName);
   const b = normalizeForMatch(offeredName);
   return a.length >= 4 && b.length >= 4 && (a.includes(b) || b.includes(a));
+}
+
+// The postcode "outward" part (e.g. "S62" from "S62 6DP") — a reliable,
+// coarse locality signal even when the full postcode wouldn't match exactly.
+function outwardCode(postcode: string | undefined): string | undefined {
+  if (!postcode) return undefined;
+  const m = postcode.trim().match(/^([A-Z]{1,2}\d[A-Z\d]?)/i);
+  return m?.[1]?.toUpperCase();
+}
+
+// A name match alone is not enough to trust a candidate — a shared name (a
+// chain, or a pharmacy named after a place it isn't actually in) can pass
+// isCloseNameMatch while being nowhere near the offered location. When the
+// message gives a postcode and the candidate has one too, they must share
+// the same outward code (locality) as well; a name match with no postcode
+// on either side to check falls through to true, since there's nothing
+// further to validate against.
+function isPlausibleMatch(candidate: PharmacyCandidate, group: ShiftGroup, offeredName: string | undefined): boolean {
+  if (offeredName && !isCloseNameMatch(candidate.name, offeredName)) return false;
+  const wantOutward = outwardCode(group.pharmacy_postcode);
+  const gotOutward = outwardCode(candidate.postcode);
+  if (wantOutward && gotOutward && wantOutward !== gotOutward) return false;
+  return true;
 }
 
 type PharmacyResolution =
@@ -664,21 +689,21 @@ async function resolvePharmacy(conversationId: string, group: ShiftGroup): Promi
     // A lone hit is NOT automatically trustworthy — Locum1st's per-word
     // fallback tier matches on any single significant word in the offered
     // name, and a pharmacy legitimately named after its own town (e.g.
-    // "Ashbourne Pharmacy") can pull back a same-substring but totally
-    // unrelated pharmacy elsewhere in the country (observed live: "Olive
-    // Pharmacy Ashbourne" in Keighley, matched purely on "Ashbourne", for a
-    // Derbyshire postcode). Only skip this check when there's no name to
-    // validate against at all (a pure postcode/area search).
+    // "Ashbourne Pharmacy", "Parkgate Pharmacy") can pull back a
+    // same-substring but totally unrelated pharmacy elsewhere in the
+    // country (observed live: "Olive Pharmacy Ashbourne" in Keighley for a
+    // Derbyshire postcode; "Knights Parkgate Pharmacy" in Pontypridd for a
+    // Rotherham one). isPlausibleMatch checks both name AND locality for
+    // this reason. Only skip the check entirely when there's neither a name
+    // nor a postcode to validate against (a bare, unqualified search).
     const only = results[0]!;
-    if (!pharmacyName || isCloseNameMatch(only.name, pharmacyName)) {
+    if (isPlausibleMatch(only, group, pharmacyName)) {
       return { status: "matched", match: only };
     }
     return { status: "ambiguous", candidates: results };
   }
-  if (pharmacyName) {
-    const close = results.filter((r) => isCloseNameMatch(r.name, pharmacyName));
-    if (close.length === 1) return { status: "matched", match: close[0]! };
-  }
+  const plausible = results.filter((r) => isPlausibleMatch(r, group, pharmacyName));
+  if (plausible.length === 1) return { status: "matched", match: plausible[0]! };
   return { status: "ambiguous", candidates: results };
 }
 
