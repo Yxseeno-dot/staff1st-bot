@@ -173,6 +173,10 @@ type ShiftGroupRaw = {
   shift_dates?: string[];
   start_time?: string | null;
   end_time?: string | null;
+  // "ASAP"/"now"/"immediately" with no concrete clock time — start_time is
+  // left null in this case (see the prompt); analyzeGroup fills in a real
+  // start_time once it knows the locum's travel time to the pharmacy.
+  start_asap?: boolean | null;
 };
 
 type ShiftGroup = {
@@ -180,8 +184,11 @@ type ShiftGroup = {
   pharmacy_postcode?: string;
   pharmacy_address?: string;
   shift_dates: string[];
+  // Placeholder ("") when start_asap is true — analyzeGroup resolves the
+  // real value before it's used for any hours/pay calculation.
   start_time: string;
   end_time: string;
+  start_asap?: boolean;
 };
 
 // Classifies what the current message wants — replaces the old regex-based
@@ -205,6 +212,7 @@ type ShiftExtraction = {
   shift_dates?: string[];
   start_time?: string;
   end_time?: string;
+  start_asap?: boolean | null;
   hourly_rate?: number | null;
   shift_type?: string;
   break_duration_minutes?: number | null;
@@ -284,18 +292,22 @@ function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
         shift_dates: ext.shift_dates,
         start_time: ext.start_time,
         end_time: ext.end_time,
+        start_asap: ext.start_asap,
       }];
 
   const groups: ShiftGroup[] = [];
   for (const g of raw) {
-    if (!g.shift_dates?.length || !g.start_time || !g.end_time) continue;
+    // An ASAP group has no concrete start_time yet — analyzeGroup fills it
+    // in from the locum's travel time before it's used for anything.
+    if (!g.shift_dates?.length || (!g.start_time && !g.start_asap) || !g.end_time) continue;
     groups.push({
       pharmacy_name: g.pharmacy_name ?? undefined,
       pharmacy_postcode: g.pharmacy_postcode ?? undefined,
       pharmacy_address: g.pharmacy_address ?? undefined,
       shift_dates: rollGroupDatesForward(g.shift_dates, today),
-      start_time: g.start_time,
+      start_time: g.start_time ?? "",
       end_time: g.end_time,
+      start_asap: g.start_asap ?? undefined,
     });
   }
   return groups;
@@ -347,6 +359,7 @@ First decide "intent" — one of:
 Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
 Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
+If the start is "ASAP", "now", "immediately", or similar — i.e. NO actual clock time is given for the start — set start_asap: true and leave start_time null. Do NOT invent a plausible-looking clock time; you have no way to know when the locum can actually get there, and a made-up time would misstate the shift's real length.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
 If end_time would be earlier than start_time, that's an overnight shift spanning into the next day — extract the times as given rather than treating them as invalid.
 If the SAME shift pattern (same pharmacy, times, and rate) is offered across multiple dates — a rota, a list of days ("Mon/Wed/Fri"), or a phrase like "every day next week" — include every date in shift_dates, not just the first one you see.
@@ -355,19 +368,20 @@ If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
 - intent: "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other" — see above
-- groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
+- groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time, start_asap (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
 - pharmacy_name: string | null (only when NOT using groups)
 - pharmacy_postcode: string | null (only when NOT using groups)
 - pharmacy_address: string | null (only when NOT using groups)
 - shift_dates: array of "YYYY-MM-DD" strings (only when NOT using groups) — every date this shift pattern applies to (usually just one, but see above)
 - start_time: "HH:MM" | null (24h, only when NOT using groups)
 - end_time: "HH:MM" | null (24h, only when NOT using groups)
+- start_asap: boolean | null (only when NOT using groups) — see above; true when the start is "ASAP"/"now"/"immediately" with no clock time given
 - hourly_rate: number | null
 - shift_type: "standard" | "overnight" | "bank_holiday"
 - break_duration_minutes: number | null (length of any lunch/rest break mentioned, in minutes)
 - break_paid: boolean (true only if the text says the break IS paid; default false — most breaks are unpaid unless stated otherwise)
-- mileage_paid: boolean (true ONLY for a per-mile rate, e.g. "45p a mile" — false if travel is a flat/fixed amount or paid as hours)
-- mileage_pence_per_mile: number | null (only set when there's a per-mile rate)
+- mileage_paid: boolean (true for a per-mile rate, e.g. "45p a mile" — ALSO true for "FM"/"full mileage"/"full mileage paid", which means mileage is reimbursed but doesn't state a pence-per-mile figure; leave mileage_pence_per_mile null in that case rather than guessing a number, and leave mileage_threshold_miles/mileage_cap_miles null too since "full" implies no threshold or cap. false if travel is a flat/fixed amount or paid as hours instead)
+- mileage_pence_per_mile: number | null (only set when the text states an actual pence-per-mile figure)
 - mileage_threshold_miles: number | null (miles each way the locum covers themselves before per-mile reimbursement starts)
 - mileage_cap_miles: number | null (miles each way beyond which the pharmacy stops reimbursing per-mile travel, e.g. "up to 30 miles") — only relevant with a per-mile rate
 - travel_allowance_fixed: number | null (a flat £ amount for the whole shift stated as MONEY, e.g. "plus £20 travel")
@@ -425,6 +439,13 @@ function tierOf(avgItems: number | null): "busy" | "moderate" | "quieter" | null
 function normalizeRole(role: string | null): string | null {
   return role === "pharmacist" ? "locum_pharmacist" : role;
 }
+
+// Matches the HMRC mileage rate Locum1st itself quotes elsewhere
+// (mileageCalc.ts's tax-relief note) — used as the assumed per-mile rate
+// when a shift says mileage is paid ("FM"/"full mileage") without stating
+// an actual pence figure. Always surfaced as an assumption in the reply,
+// never presented as a rate the pharmacy actually stated.
+const DEFAULT_MILEAGE_PENCE_PER_MILE = 55;
 
 // Same role_type values as locum1st.profiles.role_type. Pharmacist vs
 // technician/ACT/dispenser rates differ enormously, so every rate suggestion
@@ -513,6 +534,19 @@ function fmtDateWeekdayShort(d: string): string {
   return new Date(dateOnly + "T12:00:00Z").toLocaleDateString("en-GB", {
     weekday: "short", day: "numeric", month: "short",
   });
+}
+
+// Rounds a moment up to the next half-hour boundary (15:37 -> 16:00, 15:00 stays 15:00).
+function roundUpToHalfHour(d: Date): Date {
+  const ms = 30 * 60 * 1000;
+  return new Date(Math.ceil(d.getTime() / ms) * ms);
+}
+
+// UK locums work UK-local clock time — format explicitly in that zone rather
+// than the server's own (which may run in UTC) to avoid an hour-out result
+// during BST.
+function ukTimeHHMM(d: Date): string {
+  return d.toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 // Parses a typed reply to a date-selection prompt: "all", a single number,
@@ -761,7 +795,7 @@ async function analyzeGroup(
   const avgNms = avg("nms");
   const avgBp = avg("bpChecks");
 
-  type DistData = { oneway_miles?: number; return_miles?: number; duration_text?: string; error?: string };
+  type DistData = { oneway_miles?: number; return_miles?: number; duration_mins?: number; duration_text?: string; error?: string };
   // Failsafe order: a confirmed ODS address is the most precise, but once
   // there's no match, the postcode the sender actually typed geocodes far
   // more reliably than an informal address string ("Clifton Rd, Ashbourne")
@@ -782,7 +816,31 @@ async function analyzeGroup(
     dist = { error: "no_address" };
   }
 
-  const rawHours = hoursDecimal(group.start_time, group.end_time);
+  // ASAP has no concrete clock time from the message — estimate one from
+  // when the locum could actually arrive, now that `dist` (their travel
+  // time to this pharmacy) is known, rather than ever guessing a plausible-
+  // looking time with no basis. Only applies same-day; a future date with no
+  // stated time isn't "as soon as possible", so there's nothing to compute
+  // from — assume a normal 09:00 start instead.
+  let startTime = group.start_time;
+  let asapNote: string | undefined;
+  if (group.start_asap) {
+    const now = new Date();
+    const isToday = group.shift_dates[0] === now.toISOString().slice(0, 10);
+    if (isToday && !dist.error && dist.duration_mins != null) {
+      const eta = roundUpToHalfHour(new Date(now.getTime() + dist.duration_mins * 60_000));
+      startTime = ukTimeHHMM(eta);
+      asapNote = `Start time estimated as ${startTime} — current time plus your ${dist.duration_mins}-min drive to the pharmacy, rounded up to the next half hour.`;
+    } else if (isToday) {
+      startTime = ukTimeHHMM(roundUpToHalfHour(now));
+      asapNote = `Start time estimated as ${startTime} (current time rounded up to the next half hour) — couldn't work out your travel time to the pharmacy to factor it in.`;
+    } else {
+      startTime = "09:00";
+      asapNote = "No specific start time was given for this future date, so I've assumed a 09:00 start — confirm the actual time with the pharmacy.";
+    }
+  }
+
+  const rawHours = hoursDecimal(startTime, group.end_time);
   const breakMinutes = ext.break_duration_minutes ?? 0;
   const breakPaid = ext.break_paid ?? false;
   const hours = paidHours(rawHours, breakMinutes, breakPaid);
@@ -809,24 +867,25 @@ async function analyzeGroup(
   // know which rate would end up applying and, when tried, guessed a number
   // that didn't match either one.
   const travelAllowance = ext.travel_allowance_fixed ?? (ext.travel_hours_paid ? Math.round(ext.travel_hours_paid * rate) : undefined);
-  // The model has produced mileage_paid: true alongside a fixed/hours travel
-  // description with no per-mile rate — derive the persisted flag from
-  // whether a pence rate actually exists rather than trusting that boolean
-  // directly, so a mis-set flag can't misrepresent how the shift was saved.
-  const mileagePaid = ext.mileage_paid === true && ext.mileage_pence_per_mile != null;
+  // "FM"/"full mileage" sets mileage_paid true with no pence-per-mile figure
+  // stated — assume the standard HMRC rate rather than leaving it unusable,
+  // but track that it's an assumption so the reply can say so.
+  const mileageRateAssumed = ext.mileage_paid === true && ext.mileage_pence_per_mile == null;
+  const mileagePenceRate = ext.mileage_pence_per_mile ?? (mileageRateAssumed ? DEFAULT_MILEAGE_PENCE_PER_MILE : undefined);
+  const mileagePaid = ext.mileage_paid === true && mileagePenceRate != null;
 
   const template: ShiftTemplate = {
     pharmacy_name: match?.name ?? group.pharmacy_name ?? "Unknown",
     pharmacy_address: match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode,
     pharmacy_ods_code: match?.odsCode,
-    start_time: group.start_time,
+    start_time: startTime,
     end_time: group.end_time,
     hourly_rate: rate,
     shift_type: shiftType,
     break_duration_minutes: breakMinutes || undefined,
     break_paid: breakPaid,
     mileage_paid: mileagePaid,
-    mileage_pence_per_mile: ext.mileage_pence_per_mile ?? undefined,
+    mileage_pence_per_mile: mileagePenceRate,
     mileage_threshold_miles: ext.mileage_threshold_miles ?? undefined,
     mileage_cap_miles: ext.mileage_cap_miles ?? undefined,
     travel_allowance_fixed: travelAllowance,
@@ -843,10 +902,11 @@ async function analyzeGroup(
   const hoursLabel = hours % 1 === 0 ? hours : hours.toFixed(1);
   const breakNote = breakMinutes > 0 ? ` — ${breakMinutes} min ${breakPaid ? "paid" : "unpaid"} break` : "";
   if (dates.length === 1) {
-    lines.push(`**Date:** ${fmtDate(dates[0])} | ${group.start_time}–${group.end_time} (${hoursLabel} hrs paid${breakNote})`);
+    lines.push(`**Date:** ${fmtDate(dates[0])} | ${startTime}–${group.end_time} (${hoursLabel} hrs paid${breakNote})`);
   } else {
-    lines.push(`**Time:** ${group.start_time}–${group.end_time} (${hoursLabel} hrs paid${breakNote}) — offered on ${dates.length} dates, see below`);
+    lines.push(`**Time:** ${startTime}–${group.end_time} (${hoursLabel} hrs paid${breakNote}) — offered on ${dates.length} dates, see below`);
   }
+  if (asapNote) lines.push(asapNote);
 
   if (!rateProvided) {
     lines.push(`**Rate:** No rate offered — suggested: £${rate}/hr = £${totalPay} for the day`);
@@ -902,14 +962,18 @@ async function analyzeGroup(
   if (mileagePaid) {
     // Mirrors computeMileageReimbursement() (src/lib/mileageCalc.ts) — cap is
     // applied to one-way miles before the threshold is subtracted.
-    // mileagePaid already established mileage_pence_per_mile is non-null.
-    const ppm = ext.mileage_pence_per_mile!;
+    // mileagePaid already established mileagePenceRate is non-null.
+    const ppm = mileagePenceRate!;
     const threshold = ext.mileage_threshold_miles ?? 0;
     const cap = ext.mileage_cap_miles ?? null;
     let rateDesc = `${ppm}p/mile`;
     if (threshold > 0) rateDesc += ` after the first ${threshold} miles each way`;
     if (cap) rateDesc += `, up to ${cap} miles each way`;
-    lines.push(`**Mileage:** ${rateDesc} (pharmacy pays)`);
+    if (mileageRateAssumed) {
+      lines.push(`**Mileage:** "Full mileage" was mentioned but no rate was given — assuming the standard ${rateDesc} HMRC rate (pharmacy pays; confirm the actual rate with them).`);
+    } else {
+      lines.push(`**Mileage:** ${rateDesc} (pharmacy pays)`);
+    }
     if (threshold > 0) {
       lines.push(`The first ${threshold} miles each way are at your own cost.`);
     }
