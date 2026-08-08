@@ -863,22 +863,19 @@ async function resolvePharmacy(conversationId: string, group: ShiftGroup): Promi
   }
 
   if (!results.length) return { status: "not_found" };
+  // A single search result is auto-accepted without asking, even when
+  // isPlausibleMatch would flag it as an uncertain name/locality match.
+  // Known risk, by explicit request: Locum1st's per-word fallback tier
+  // matches on any single significant word in the offered name, and a
+  // pharmacy legitimately named after its own town (e.g. "Ashbourne
+  // Pharmacy", "Parkgate Pharmacy") can pull back a same-substring but
+  // totally unrelated pharmacy elsewhere in the country — this has happened
+  // live before ("Olive Pharmacy Ashbourne" in Keighley auto-suggested for a
+  // Derbyshire postcode; "Knights Parkgate Pharmacy" in Pontypridd for a
+  // Rotherham one). Those cases used to stop at "ambiguous" and ask the user
+  // to confirm; now they'll be attached silently instead.
   if (results.length === 1) {
-    // A lone hit is NOT automatically trustworthy — Locum1st's per-word
-    // fallback tier matches on any single significant word in the offered
-    // name, and a pharmacy legitimately named after its own town (e.g.
-    // "Ashbourne Pharmacy", "Parkgate Pharmacy") can pull back a
-    // same-substring but totally unrelated pharmacy elsewhere in the
-    // country (observed live: "Olive Pharmacy Ashbourne" in Keighley for a
-    // Derbyshire postcode; "Knights Parkgate Pharmacy" in Pontypridd for a
-    // Rotherham one). isPlausibleMatch checks both name AND locality for
-    // this reason. Only skip the check entirely when there's neither a name
-    // nor a postcode to validate against (a bare, unqualified search).
-    const only = results[0]!;
-    if (isPlausibleMatch(only, group, pharmacyName)) {
-      return { status: "matched", match: only };
-    }
-    return { status: "ambiguous", candidates: results };
+    return { status: "matched", match: results[0]! };
   }
   const plausible = results.filter((r) => isPlausibleMatch(r, group, pharmacyName));
   if (plausible.length === 1) return { status: "matched", match: plausible[0]! };
