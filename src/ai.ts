@@ -94,6 +94,20 @@ type State =
       role: string | null;
       resolved: (PharmacyCandidate | undefined)[];
       candidates: PharmacyCandidate[];
+    }
+  // The pharmacy couldn't be found in Data1st AND the message itself gave no
+  // postcode/address to fall back on for that group — proceeding silently
+  // here is exactly how a shift ends up saved with no usable location at all
+  // (no map pin possible from a bare pharmacy name). groupIndex identifies
+  // which group in `groups` is waiting on this reply so it can be updated in
+  // place and handleShiftAnalysis resumed from there.
+  | {
+      phase: "awaiting_postcode";
+      ext: ShiftExtraction;
+      groups: ShiftGroup[];
+      role: string | null;
+      resolved: (PharmacyCandidate | undefined)[];
+      groupIndex: number;
     };
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
@@ -356,6 +370,19 @@ function ensureAddressHasPostcode(address: string | undefined, postcode: string 
   const lastSegment = addr.split(",").pop()?.trim() ?? "";
   if (isUKPostcode(lastSegment) || addr.toUpperCase().includes(pc.toUpperCase())) return addr;
   return `${addr}, ${pc}`;
+}
+
+// Unlike isUKPostcode (whole-string match, used once we already believe a
+// segment IS a postcode), this looks for one ANYWHERE in a longer string —
+// used to check whether a group has enough location info to geocode at all
+// before deciding whether to ask the user for a postcode.
+function containsUKPostcode(text: string | undefined): boolean {
+  if (!text) return false;
+  return /[A-Za-z]{1,2}\d[A-Za-z0-9]?\s?\d[A-Za-z]{2}/.test(text);
+}
+
+function hasUsableLocation(group: ShiftGroup): boolean {
+  return containsUKPostcode(group.pharmacy_postcode) || containsUKPostcode(group.pharmacy_address);
 }
 
 // Resolves the message into one or more pharmacy groups, each with concrete
@@ -1141,6 +1168,20 @@ async function handleShiftAnalysis(
         resolution.candidates.map((c) => ({ name: c.name, address: c.address }))
       );
     }
+    if (resolution.status === "not_found" && !hasUsableLocation(group)) {
+      setState(conversationId, {
+        phase: "awaiting_postcode",
+        ext,
+        groups,
+        role,
+        resolved: matches,
+        groupIndex: i,
+      });
+      const label = group.pharmacy_name ? `"${group.pharmacy_name}"` : "that pharmacy";
+      return plain(
+        `I couldn't find ${label} and there's no postcode in the message to fall back on — without one I can't place it on the map. What's its postcode? (Reply "skip" to log it anyway without a mappable location.)`
+      );
+    }
     matches.push(resolution.status === "matched" ? resolution.match : undefined);
   }
 
@@ -1401,6 +1442,16 @@ export async function processMessage(
       return plain(`That number isn't in the list. Reply with a number from 1 to ${state.candidates.length}, or "none".`);
     }
     setState(conversationId, { phase: "idle" });
+  }
+
+  // ── Awaiting a postcode (pharmacy not found, message gave no location) ──
+  if (state.phase === "awaiting_postcode") {
+    if (/^(none|skip|cancel)\b/i.test(trimmed)) {
+      return handleShiftAnalysis(conversationId, userId, state.ext, state.groups, state.role, [...state.resolved, undefined]);
+    }
+    const updatedGroups = [...state.groups];
+    updatedGroups[state.groupIndex] = { ...updatedGroups[state.groupIndex]!, pharmacy_postcode: trimmed };
+    return handleShiftAnalysis(conversationId, userId, state.ext, updatedGroups, state.role, state.resolved);
   }
 
   // ── Pro check ───────────────────────────────────────────────────────────
