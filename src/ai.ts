@@ -108,6 +108,16 @@ type State =
       role: string | null;
       resolved: (PharmacyCandidate | undefined)[];
       groupIndex: number;
+    }
+  // The message flagged its own rate as negotiable/TBC with no figure given
+  // — asked before any pharmacy resolution or analysis starts, since the
+  // whole point is to use the REAL agreed rate rather than silently saving
+  // a market-rate guess as if it were the deal that was struck.
+  | {
+      phase: "awaiting_rate";
+      ext: ShiftExtraction;
+      groups: ShiftGroup[];
+      role: string | null;
     };
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
@@ -254,6 +264,15 @@ type ShiftExtraction = {
   end_time?: string;
   start_asap?: boolean | null;
   hourly_rate?: number | null;
+  // True when the message explicitly says the rate is negotiable/TBC/to be
+  // agreed, as opposed to simply not mentioning one at all. Distinct from a
+  // bare missing hourly_rate: that case already shows a market-rate
+  // SUGGESTION to counter with (see rateProvided in analyzeGroup) without
+  // pretending it's a real number. An explicitly negotiable shift is
+  // different — there's a genuine agreed figure somewhere that just hasn't
+  // been extracted yet, so the bot asks for it upfront rather than silently
+  // saving the benchmark guess as if it were the deal that was struck.
+  rate_negotiable?: boolean | null;
   shift_type?: string;
   break_duration_minutes?: number | null;
   break_paid?: boolean;
@@ -489,6 +508,7 @@ Fields:
 - end_time: "HH:MM" | null (24h, only when NOT using groups)
 - start_asap: boolean | null (only when NOT using groups) — see above; true when the start is "ASAP"/"now"/"immediately" with no clock time given
 - hourly_rate: number | null
+- rate_negotiable: boolean | null — true ONLY if the text explicitly says the rate is negotiable, TBC, "to be agreed", "rate negotiable", or similar — NOT simply because no rate happens to be mentioned. Leave null/false for a message that just doesn't state a rate at all (that case is handled differently downstream). If the text says negotiable but ALSO states what was actually agreed ("rate negotiable, settled on £32/hr"), set hourly_rate to that figure and leave rate_negotiable false — the negotiation is already resolved, there's nothing left to ask.
 - shift_type: "standard" | "overnight" | "bank_holiday"
 - break_duration_minutes: number | null (length of any lunch/rest break mentioned, in minutes)
 - break_paid: boolean (true only if the text says the break IS paid; default false — most breaks are unpaid unless stated otherwise)
@@ -659,6 +679,18 @@ function roundUpToHalfHour(d: Date): Date {
 // during BST.
 function ukTimeHHMM(d: Date): string {
   return d.toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// Pulls the first plausible £/hr figure out of a free-text reply like "£32",
+// "32/hr", or "we agreed 32.50" — capped well above any real locum rate as a
+// sanity check against parsing an unrelated number (a date, a shift count)
+// as the rate. Returns null if nothing plausible is found, not 0 — a
+// mis-parsed rate of 0 would silently zero out the whole shift's pay.
+function parseStatedRate(input: string): number | null {
+  const m = input.match(/(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = parseFloat(m[1]!);
+  return n > 0 && n < 500 ? n : null;
 }
 
 // Parses a typed reply to a date-selection prompt: "all", a single number,
@@ -1454,6 +1486,18 @@ export async function processMessage(
     return handleShiftAnalysis(conversationId, userId, state.ext, updatedGroups, state.role, state.resolved);
   }
 
+  // ── Awaiting the agreed rate (message flagged it as negotiable) ─────────
+  if (state.phase === "awaiting_rate") {
+    if (/^(skip|not sure|tbc|don'?t know)\b/i.test(trimmed)) {
+      return handleShiftAnalysis(conversationId, userId, state.ext, state.groups, state.role);
+    }
+    const stated = parseStatedRate(trimmed);
+    if (stated == null) {
+      return plain(`I couldn't work out a rate from that — what's the £/hr you agreed, e.g. "£32"? (Or reply "skip".)`);
+    }
+    return handleShiftAnalysis(conversationId, userId, { ...state.ext, hourly_rate: stated }, state.groups, state.role);
+  }
+
   // ── Pro check ───────────────────────────────────────────────────────────
   const userStatus = await botFetch<{ linked?: boolean; pro?: boolean; role_type?: string | null }>(
     `/user?auth_user_id=${encodeURIComponent(userId)}`
@@ -1512,6 +1556,13 @@ export async function processMessage(
       }
     }
     return plain("I couldn't work out the date, start time and end time for that shift — could you fill that in?");
+  }
+
+  if (ext.rate_negotiable === true && ext.hourly_rate == null) {
+    setState(conversationId, { phase: "awaiting_rate", ext, groups, role });
+    return plain(
+      `This shift's rate is negotiable — what did you agree with the pharmacy? (Reply "skip" to see a suggested market rate instead of logging a firm figure.)`
+    );
   }
 
   console.log(
