@@ -214,11 +214,19 @@ type ShiftExtraction = {
   // True when the message describes a shift the locum already worked
   // (retrospective logging — "I did a shift at...", "worked Tuesday at...")
   // rather than a future offer being forwarded ("shift available", "need
-  // cover", a broadcast). Governs date resolution: an offer's bare "14 June"
-  // means the next upcoming occurrence, but the same bare date in a
-  // retrospective message means the most recent PAST occurrence — rolling it
-  // forward would fabricate a future shift out of one that already happened.
+  // cover", a broadcast). Used alongside dates_explicit_year below: when a
+  // bare date's year is being inferred (not stated), already_occurred tells
+  // the code whether an inferred-past date is expected (skip rolling it
+  // forward entirely, regardless of how far back it is) or not (apply the
+  // normal recent-past grace window, then roll forward beyond it).
   already_occurred?: boolean | null;
+  // True if the message's shift date(s) included an explicit year (e.g.
+  // "14 June 2025", "14/06/2027", "2026-06-14") — false/omitted for a bare
+  // day+month with no year. This is the ONLY thing the model should decide
+  // about the year; do NOT also try to guess whether a bare date "really
+  // means" this year or next year — see the date-resolution instructions
+  // below for why, and use them for how to fill shift_dates in each case.
+  dates_explicit_year?: boolean | null;
   // Set when the message offers shifts at more than one distinct pharmacy —
   // each with its own dates/times. When absent, the top-level
   // pharmacy_name/shift_dates/start_time/end_time fields below describe the
@@ -299,22 +307,26 @@ function addYears(dateStr: string, years: number): string {
   return `${parseInt(m[1]!, 10) + years}-${m[2]}-${m[3]}`;
 }
 
-// The LLM is asked to resolve a day+month with no year ("14 June") against
-// "today", but it frequently just echoes the current year even when that
-// date has already passed — offering a shift that already happened. Correct
-// for that by rolling every date in the SAME group forward by the same
-// number of years, but only when every date in the group is in the past. If
-// even one sibling date in the same rota is already on/after today, the
-// group is already anchored to the right year, and a date just a little
-// behind it (e.g. "yesterday" in a rota that also covers today — an offer
-// forwarded a day late) isn't evidence of a stale-year echo, so leave it
-// alone rather than rolling that one date a full year ahead of its siblings.
-function rollGroupDatesForward(dates: string[], today: string, alreadyOccurred: boolean): string[] {
+// The LLM always fills a bare day+month ("14 June", no year stated) in using
+// the CURRENT year — it's deliberately not asked to judge whether that
+// should "really" be next year, because that's arithmetic against today's
+// date and a 3-month grace window, which is far more reliably done in code
+// than hoped for from a model. This is where that arithmetic actually
+// happens: roll every date in the SAME group forward by the same number of
+// years, but only when every date in the group is in the past (beyond the
+// grace window in yearsToRollForward). If even one sibling date in the same
+// rota is already on/after today, the group is already anchored to the right
+// year, and a date just a little behind it (e.g. "yesterday" in a rota that
+// also covers today — an offer forwarded a day late) isn't evidence the
+// whole group needs rolling, so leave it alone rather than rolling that one
+// date a full year ahead of its siblings.
+function rollGroupDatesForward(dates: string[], today: string, alreadyOccurred: boolean, explicitYear: boolean): string[] {
+  // An explicit year in the text ("14 June 2025") is never adjusted,
+  // whatever it resolves to relative to today.
+  if (explicitYear) return dates;
   // A retrospective log ("I worked 14 June") is expected to be in the past —
   // that's not a stale-year echo to correct, it's the whole point of the
-  // message. Trust the model's own resolution (already instructed to resolve
-  // bare dates to the most recent PAST occurrence in this case) rather than
-  // rolling it forward into a shift that hasn't happened yet.
+  // message. Never roll it forward, however far back it is.
   if (alreadyOccurred) return dates;
   const deltas = dates.map((d) => yearsToRollForward(d, today));
   if (deltas.some((delta) => delta === 0)) return dates;
@@ -353,6 +365,7 @@ function ensureAddressHasPostcode(address: string | undefined, postcode: string 
 function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
   const today = londonToday();
   const alreadyOccurred = ext.already_occurred === true;
+  const explicitYear = ext.dates_explicit_year === true;
   const raw: ShiftGroupRaw[] = ext.groups?.length
     ? ext.groups
     : [{
@@ -374,7 +387,7 @@ function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
       pharmacy_name: g.pharmacy_name ?? undefined,
       pharmacy_postcode: g.pharmacy_postcode ?? undefined,
       pharmacy_address: g.pharmacy_address ?? undefined,
-      shift_dates: rollGroupDatesForward(g.shift_dates, today, alreadyOccurred),
+      shift_dates: rollGroupDatesForward(g.shift_dates, today, alreadyOccurred, explicitYear),
       start_time: g.start_time ?? "",
       end_time: g.end_time,
       start_asap: g.start_asap ?? undefined,
@@ -427,7 +440,7 @@ First decide "intent" — one of:
 - "greeting": a greeting, or a general "what can you do"/help question, with no specific shift or account action attached.
 - "other": anything else that doesn't fit the above — chit-chat, an unrelated question, or unclear intent.
 Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
-Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") — resolve it in the CURRENT year by default. If that current-year date has already passed relative to today, still keep it in the current year as long as it's no more than 3 months ago — e.g. "14 May" mentioned in August is this May, a recent backdated shift, NOT next year's. Only push it to NEXT year if it's MORE than 3 months in the past — that's the real "this must mean next year" case (e.g. "14 June" mentioned in December, where June has been gone for six months). If already_occurred is true (the locum is logging a shift they already worked, not an offer), skip all of the above: always resolve a bare day+month to the most recent PAST occurrence of that date, however many months back that is — never roll it into the future, since that would fabricate a shift that hasn't happened yet out of one that already did.
+Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with NO year stated (e.g. "14 June") — ALWAYS use the CURRENT year (${today.slice(0, 4)}) in shift_dates, and set dates_explicit_year: false. Do NOT try to work out yourself whether it "really means" this year or next year — that determination happens outside this step using already_occurred and how far away the date is, not by you guessing here. Your only job for a bare date is: current year, always. If the text DOES give an explicit year in any form ("14 June 2025", "14/06/2027", "2026-06-14"), use exactly that year and set dates_explicit_year: true — those are never adjusted afterwards, so get the stated year right.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If the start is "ASAP", "now", "immediately", or similar — i.e. NO actual clock time is given for the start — set start_asap: true and leave start_time null. Do NOT invent a plausible-looking clock time; you have no way to know when the locum can actually get there, and a made-up time would misstate the shift's real length.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
@@ -438,7 +451,8 @@ If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
 - intent: "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other" — see above
-- already_occurred: boolean | null (only when intent is "shift_offer") — true if the locum is logging a shift they already worked, false/null if it's a future offer/broadcast. See above — this changes how bare dates without a year are resolved.
+- already_occurred: boolean | null (only when intent is "shift_offer") — true if the locum is logging a shift they already worked, false/null if it's a future offer/broadcast.
+- dates_explicit_year: boolean | null (only when intent is "shift_offer") — true if the message's date(s) stated an explicit year, false/null for a bare day+month. See above — do not guess a "meant" year yourself, just report whether one was stated.
 - groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time, start_asap (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
 - pharmacy_name: string | null (only when NOT using groups)
 - pharmacy_postcode: string | null (only when NOT using groups)
