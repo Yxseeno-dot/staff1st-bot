@@ -19,6 +19,16 @@ if (!BOT_USER_ID) throw new Error("BOT_USER_ID is required");
 
 const HISTORY_LIMIT = 5;
 
+// UK-local calendar date, not the server's (likely UTC) date. The UK is
+// always UTC+0 or UTC+1, never behind — so a plain `new Date().toISOString()`
+// during the 00:00-01:00 BST window (or any time the server clock and UK
+// wall-clock calendar date disagree) tells the model "today" is still
+// yesterday, which then resolves "today"/"tomorrow" one day too early and
+// can land a shift_date in the past relative to actual UK time.
+function londonToday(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/London" }).format(new Date());
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 // Recursive JSON-safe type, stored as JSONB on locum1st.messages.metadata
@@ -201,6 +211,14 @@ type Intent = "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "oth
 
 type ShiftExtraction = {
   intent: Intent;
+  // True when the message describes a shift the locum already worked
+  // (retrospective logging — "I did a shift at...", "worked Tuesday at...")
+  // rather than a future offer being forwarded ("shift available", "need
+  // cover", a broadcast). Governs date resolution: an offer's bare "14 June"
+  // means the next upcoming occurrence, but the same bare date in a
+  // retrospective message means the most recent PAST occurrence — rolling it
+  // forward would fabricate a future shift out of one that already happened.
+  already_occurred?: boolean | null;
   // Set when the message offers shifts at more than one distinct pharmacy —
   // each with its own dates/times. When absent, the top-level
   // pharmacy_name/shift_dates/start_time/end_time fields below describe the
@@ -270,11 +288,41 @@ function addYears(dateStr: string, years: number): string {
 // behind it (e.g. "yesterday" in a rota that also covers today — an offer
 // forwarded a day late) isn't evidence of a stale-year echo, so leave it
 // alone rather than rolling that one date a full year ahead of its siblings.
-function rollGroupDatesForward(dates: string[], today: string): string[] {
+function rollGroupDatesForward(dates: string[], today: string, alreadyOccurred: boolean): string[] {
+  // A retrospective log ("I worked 14 June") is expected to be in the past —
+  // that's not a stale-year echo to correct, it's the whole point of the
+  // message. Trust the model's own resolution (already instructed to resolve
+  // bare dates to the most recent PAST occurrence in this case) rather than
+  // rolling it forward into a shift that hasn't happened yet.
+  if (alreadyOccurred) return dates;
   const deltas = dates.map((d) => yearsToRollForward(d, today));
   if (deltas.some((delta) => delta === 0)) return dates;
   const maxDelta = Math.max(...deltas);
   return dates.map((d) => addYears(d, maxDelta));
+}
+
+// The app parses a shift's saved address by splitting on commas and checking
+// whether the LAST segment is a bare UK postcode (Locum1st/ios-app's
+// applyParsedAddress) — and separately, CLGeocoder does much better with a
+// postcode present than with a pharmacy name and street alone. A confirmed
+// Data1st match's address already ends this way, but the fallback chain here
+// used the LLM's free-text pharmacy_address when matching failed, which is
+// rarely formatted with the postcode as its own trailing comma segment (or
+// may be missing a postcode entirely) — silently breaking both. Always
+// append the known postcode as its own segment unless it's already there.
+function isUKPostcode(text: string): boolean {
+  return /^[A-Za-z]{1,2}\d[A-Za-z0-9]? ?\d[A-Za-z]{2}$/.test(text.trim());
+}
+
+function ensureAddressHasPostcode(address: string | undefined, postcode: string | undefined): string | undefined {
+  const addr = address?.trim();
+  const pc = postcode?.trim();
+  if (!pc) return addr || undefined;
+  if (!addr) return pc;
+
+  const lastSegment = addr.split(",").pop()?.trim() ?? "";
+  if (isUKPostcode(lastSegment) || addr.toUpperCase().includes(pc.toUpperCase())) return addr;
+  return `${addr}, ${pc}`;
 }
 
 // Resolves the message into one or more pharmacy groups, each with concrete
@@ -282,7 +330,8 @@ function rollGroupDatesForward(dates: string[], today: string): string[] {
 // single group built from the legacy flat fields (the common case). Drops
 // any group missing dates/start/end rather than failing the whole message.
 function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = londonToday();
+  const alreadyOccurred = ext.already_occurred === true;
   const raw: ShiftGroupRaw[] = ext.groups?.length
     ? ext.groups
     : [{
@@ -304,7 +353,7 @@ function normalizeGroups(ext: ShiftExtraction): ShiftGroup[] {
       pharmacy_name: g.pharmacy_name ?? undefined,
       pharmacy_postcode: g.pharmacy_postcode ?? undefined,
       pharmacy_address: g.pharmacy_address ?? undefined,
-      shift_dates: rollGroupDatesForward(g.shift_dates, today),
+      shift_dates: rollGroupDatesForward(g.shift_dates, today, alreadyOccurred),
       start_time: g.start_time ?? "",
       end_time: g.end_time,
       start_asap: g.start_asap ?? undefined,
@@ -334,7 +383,7 @@ async function fetchRecentHistory(conversationId: string, currentMessageId: stri
 }
 
 async function extractShift(text: string, history: HistoryTurn[]): Promise<ShiftExtraction> {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = londonToday();
   const todayWeekday = new Date(`${today}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long" });
   const res = await client.chat.completions.create({
     model: MODEL,
@@ -351,13 +400,13 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
         content: `You're the message handler for a locum pharmacist's shift-tracking bot. Classify the CURRENT message's intent and, if it's a shift offer, extract its details. Return JSON.
 Recent conversation history is provided for context (e.g. shift details split across several messages, or a follow-up like "actually make it 8am") — the CURRENT message is the last one; prior ones are context only, do not re-report a shift that was already fully extracted and confirmed earlier unless the current message adds to or changes it.
 First decide "intent" — one of:
-- "shift_offer": the message is offering, describing, or forwarding one or more concrete shifts at a pharmacy — a broadcast, a rota, or a single shift. This includes messages that also happen to mention words like "cancelled" or "removed" in passing (e.g. "previous rota cancelled, new shift below") — that's still a shift offer, not a cancel request.
+- "shift_offer": the message is offering, describing, or forwarding one or more concrete shifts at a pharmacy — a broadcast, a rota, or a single shift. This includes messages that also happen to mention words like "cancelled" or "removed" in passing (e.g. "previous rota cancelled, new shift below") — that's still a shift offer, not a cancel request. It ALSO includes the locum describing a shift they already worked, for their own record ("I did a shift at Boots Tuesday", "worked 9-5 at Lloyds yesterday, £25/hr") — set already_occurred: true for these (see below); it's the same extraction, just already in the past rather than upcoming.
 - "cancel_shift": the sender (the locum) wants to cancel/delete/remove a shift THEY have already logged with Locum1st — not a shift offer describing some other change.
 - "show_shifts": the sender wants to see their own logged/upcoming shifts.
 - "greeting": a greeting, or a general "what can you do"/help question, with no specific shift or account action attached.
 - "other": anything else that doesn't fit the above — chit-chat, an unrelated question, or unclear intent.
 Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
-Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year.
+Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") normally means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year. BUT if already_occurred is true (the locum is logging a shift they already worked, not an offer), it's the opposite: a bare day+month with no year means the most recent PAST occurrence of that date — never roll it into the future, since that would fabricate a shift that hasn't happened yet out of one that already did.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If the start is "ASAP", "now", "immediately", or similar — i.e. NO actual clock time is given for the start — set start_asap: true and leave start_time null. Do NOT invent a plausible-looking clock time; you have no way to know when the locum can actually get there, and a made-up time would misstate the shift's real length.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
@@ -368,6 +417,7 @@ If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
 - intent: "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other" — see above
+- already_occurred: boolean | null (only when intent is "shift_offer") — true if the locum is logging a shift they already worked, false/null if it's a future offer/broadcast. See above — this changes how bare dates without a year are resolved.
 - groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time, start_asap (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
 - pharmacy_name: string | null (only when NOT using groups)
 - pharmacy_postcode: string | null (only when NOT using groups)
@@ -876,7 +926,7 @@ async function analyzeGroup(
 
   const template: ShiftTemplate = {
     pharmacy_name: match?.name ?? group.pharmacy_name ?? "Unknown",
-    pharmacy_address: match?.address ?? group.pharmacy_address ?? group.pharmacy_postcode,
+    pharmacy_address: ensureAddressHasPostcode(match?.address ?? group.pharmacy_address, match?.postcode ?? group.pharmacy_postcode),
     pharmacy_ods_code: match?.odsCode,
     start_time: startTime,
     end_time: group.end_time,
