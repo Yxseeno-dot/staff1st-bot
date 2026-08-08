@@ -257,11 +257,32 @@ type ShiftExtraction = {
   recurring_availability?: string | null;
 };
 
+// A grace window on "already passed this year" — a date up to this many
+// calendar months before today reads as a recent backdated shift ("14 May"
+// mentioned in August is almost certainly this May), not an offer for the
+// same date next year. Beyond this window, "next year" becomes the more
+// plausible reading again — the classic case this whole correction exists
+// for: an offer for "14 June" sent once it's already December, which as an
+// OFFER really must mean next June.
+const RECENT_PAST_GRACE_MONTHS = 3;
+
+// True if dateStr (YYYY-MM-DD) is on/before today and no more than `months`
+// calendar months before it.
+function isWithinPastGraceWindow(dateStr: string, today: string, months: number): boolean {
+  if (dateStr > today) return false;
+  const [ty, tm, td] = today.split("-").map(Number) as [number, number, number];
+  const cutoff = new Date(Date.UTC(ty, tm - 1 - months, td));
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  return dateStr >= cutoffStr;
+}
+
 // Number of whole years dateStr's year needs to advance by to land on or
-// after `today` (both YYYY-MM-DD) — 0 if it's already on/after today.
+// after `today` (both YYYY-MM-DD) — 0 if it's already on/after today, or if
+// it's within the recent-past grace window above.
 function yearsToRollForward(dateStr: string, today: string): number {
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return 0;
+  if (isWithinPastGraceWindow(dateStr, today, RECENT_PAST_GRACE_MONTHS)) return 0;
   let year = parseInt(m[1]!, 10);
   const monthDay = `${m[2]}-${m[3]}`;
   let years = 0;
@@ -406,7 +427,7 @@ First decide "intent" — one of:
 - "greeting": a greeting, or a general "what can you do"/help question, with no specific shift or account action attached.
 - "other": anything else that doesn't fit the above — chit-chat, an unrelated question, or unclear intent.
 Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
-Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") normally means the NEXT time that date occurs — if that date has already passed this year, it means next year, not this year. BUT if already_occurred is true (the locum is logging a shift they already worked, not an offer), it's the opposite: a bare day+month with no year means the most recent PAST occurrence of that date — never roll it into the future, since that would fabricate a shift that hasn't happened yet out of one that already did.
+Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with no year (e.g. "14 June") — resolve it in the CURRENT year by default. If that current-year date has already passed relative to today, still keep it in the current year as long as it's no more than 3 months ago — e.g. "14 May" mentioned in August is this May, a recent backdated shift, NOT next year's. Only push it to NEXT year if it's MORE than 3 months in the past — that's the real "this must mean next year" case (e.g. "14 June" mentioned in December, where June has been gone for six months). If already_occurred is true (the locum is logging a shift they already worked, not an offer), skip all of the above: always resolve a bare day+month to the most recent PAST occurrence of that date, however many months back that is — never roll it into the future, since that would fabricate a shift that hasn't happened yet out of one that already did.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If the start is "ASAP", "now", "immediately", or similar — i.e. NO actual clock time is given for the start — set start_asap: true and leave start_time null. Do NOT invent a plausible-looking clock time; you have no way to know when the locum can actually get there, and a made-up time would misstate the shift's real length.
 If only a duration is given alongside a start time (e.g. "8 hour shift from 9am"), compute end_time yourself from start_time + duration.
