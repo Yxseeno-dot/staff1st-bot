@@ -8,7 +8,7 @@ import { execute, query } from "./db.js";
 // processMessage() forever, leaving the bot's "typing" heartbeat running
 // indefinitely (see botFetch below for the matching issue on our own API calls).
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch, timeout: 20_000 });
-const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
 
 const BEARER = process.env.BOT_API_BEARER;
 if (!BEARER) throw new Error("BOT_API_BEARER is required");
