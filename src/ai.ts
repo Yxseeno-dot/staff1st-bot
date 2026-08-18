@@ -9,6 +9,7 @@ import { execute, query } from "./db.js";
 // indefinitely (see botFetch below for the matching issue on our own API calls).
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch, timeout: 20_000 });
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
+const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL ?? "gpt-4o-mini";
 
 const BEARER = process.env.BOT_API_BEARER;
 if (!BEARER) throw new Error("BOT_API_BEARER is required");
@@ -465,8 +466,8 @@ async function fetchRecentHistory(conversationId: string, currentMessageId: stri
 async function extractShift(text: string, history: HistoryTurn[]): Promise<ShiftExtraction> {
   const today = londonToday();
   const todayWeekday = new Date(`${today}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long" });
-  const res = await client.chat.completions.create({
-    model: MODEL,
+  const createCompletion = (model: string) => client.chat.completions.create({
+    model,
     response_format: { type: "json_object" },
     // A multi-group broadcast (several pharmacies, or one pharmacy with
     // several one-off dates) can easily need more than a couple hundred
@@ -526,6 +527,17 @@ These three travel fields (mileage_paid+mileage_pence_per_mile / travel_allowanc
       { role: "user", content: text },
     ],
   });
+  let res;
+  try {
+    res = await createCompletion(MODEL);
+  } catch (err) {
+    const apiError = err as { status?: number; code?: string };
+    if (MODEL === FALLBACK_MODEL || apiError.status !== 403 || apiError.code !== "model_not_found") {
+      throw err;
+    }
+    console.error(`[ai] ${MODEL} access failed; retrying with ${FALLBACK_MODEL}.`);
+    res = await createCompletion(FALLBACK_MODEL);
+  }
   const choice = res.choices[0];
   try {
     return JSON.parse(choice?.message?.content ?? "{}") as ShiftExtraction;
