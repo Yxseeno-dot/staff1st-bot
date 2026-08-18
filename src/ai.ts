@@ -388,17 +388,8 @@ function ensureAddressHasPostcode(address: string | undefined, postcode: string 
   return `${addr}, ${pc}`;
 }
 
-// Unlike isUKPostcode (whole-string match, used once we already believe a
-// segment IS a postcode), this looks for one ANYWHERE in a longer string —
-// used to check whether a group has enough location info to geocode at all
-// before deciding whether to ask the user for a postcode.
-function containsUKPostcode(text: string | undefined): boolean {
-  if (!text) return false;
-  return /[A-Za-z]{1,2}\d[A-Za-z0-9]?\s?\d[A-Za-z]{2}/.test(text);
-}
-
 function hasUsableLocation(group: ShiftGroup): boolean {
-  return containsUKPostcode(group.pharmacy_postcode) || containsUKPostcode(group.pharmacy_address);
+  return normalizedPostcode(group.pharmacy_postcode) != null || normalizedPostcode(group.pharmacy_address) != null;
 }
 
 // Resolves the message into one or more pharmacy groups, each with concrete
@@ -803,26 +794,23 @@ function isCloseNameMatch(candidateName: string, offeredName: string): boolean {
   return a.length >= 4 && b.length >= 4 && (a.includes(b) || b.includes(a));
 }
 
-// The postcode "outward" part (e.g. "S62" from "S62 6DP") — a reliable,
-// coarse locality signal even when the full postcode wouldn't match exactly.
-function outwardCode(postcode: string | undefined): string | undefined {
-  if (!postcode) return undefined;
-  const m = postcode.trim().match(/^([A-Z]{1,2}\d[A-Z\d]?)/i);
-  return m?.[1]?.toUpperCase();
+function normalizedPostcode(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const match = text.match(/\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b/i);
+  return match?.[1]?.replace(/\s/g, "").toUpperCase();
 }
 
 // A name match alone is not enough to trust a candidate — a shared name (a
 // chain, or a pharmacy named after a place it isn't actually in) can pass
 // isCloseNameMatch while being nowhere near the offered location. When the
-// message gives a postcode and the candidate has one too, they must share
-// the same outward code (locality) as well; a name match with no postcode
-// on either side to check falls through to true, since there's nothing
-// further to validate against.
+// message gives a postcode (either separately or inside its address), the
+// candidate must expose the exact same normalized postcode. A candidate with
+// a missing or different postcode is not safe to auto-select.
 function isPlausibleMatch(candidate: PharmacyCandidate, group: ShiftGroup, offeredName: string | undefined): boolean {
   if (offeredName && !isCloseNameMatch(candidate.name, offeredName)) return false;
-  const wantOutward = outwardCode(group.pharmacy_postcode);
-  const gotOutward = outwardCode(candidate.postcode);
-  if (wantOutward && gotOutward && wantOutward !== gotOutward) return false;
+  const offeredPostcode = normalizedPostcode(group.pharmacy_postcode) ?? normalizedPostcode(group.pharmacy_address);
+  const candidatePostcode = normalizedPostcode(candidate.postcode) ?? normalizedPostcode(candidate.address);
+  if (offeredPostcode && candidatePostcode !== offeredPostcode) return false;
   return true;
 }
 
@@ -843,8 +831,9 @@ type PharmacyResolution =
 // user or fall back to unmatched.
 async function resolvePharmacy(conversationId: string, group: ShiftGroup): Promise<PharmacyResolution> {
   const pharmacyName = group.pharmacy_name?.trim() || undefined;
+  const offeredPostcode = normalizedPostcode(group.pharmacy_postcode) ?? normalizedPostcode(group.pharmacy_address);
   const pharmacyArea = [group.pharmacy_postcode, group.pharmacy_address].filter(Boolean).join(" ").trim() || undefined;
-  if (!pharmacyName && !pharmacyArea) return { status: "not_found" };
+  if (!offeredPostcode) return { status: "not_found" };
 
   const params = new URLSearchParams();
   if (pharmacyName) {
@@ -871,23 +860,20 @@ async function resolvePharmacy(conversationId: string, group: ShiftGroup): Promi
   }
 
   if (!results.length) return { status: "not_found" };
-  // A single search result is auto-accepted without asking, even when
-  // isPlausibleMatch would flag it as an uncertain name/locality match.
-  // Known risk, by explicit request: Locum1st's per-word fallback tier
-  // matches on any single significant word in the offered name, and a
-  // pharmacy legitimately named after its own town (e.g. "Ashbourne
-  // Pharmacy", "Parkgate Pharmacy") can pull back a same-substring but
-  // totally unrelated pharmacy elsewhere in the country — this has happened
-  // live before ("Olive Pharmacy Ashbourne" in Keighley auto-suggested for a
-  // Derbyshire postcode; "Knights Parkgate Pharmacy" in Pontypridd for a
-  // Rotherham one). Those cases used to stop at "ambiguous" and ask the user
-  // to confirm; now they'll be attached silently instead.
-  if (results.length === 1) {
-    return { status: "matched", match: results[0]! };
-  }
-  const plausible = results.filter((r) => isPlausibleMatch(r, group, pharmacyName));
-  if (plausible.length === 1) return { status: "matched", match: plausible[0]! };
-  return { status: "ambiguous", candidates: results };
+  // Never show or attach a candidate from a different postcode. Search
+  // fallbacks can return a strong name match elsewhere in the country, and
+  // letting the user select it would still associate the wrong ODS record.
+  const samePostcode = results.filter((candidate) => {
+    const candidatePostcode = normalizedPostcode(candidate.postcode) ?? normalizedPostcode(candidate.address);
+    return candidatePostcode === offeredPostcode;
+  });
+  if (!samePostcode.length) return { status: "not_found" };
+
+  const plausible = samePostcode.filter((r) => isPlausibleMatch(r, group, pharmacyName));
+  // A postcode-only offer has no pharmacy name to verify, so even a single
+  // result needs explicit confirmation from the user before it is attached.
+  if (pharmacyName && plausible.length === 1) return { status: "matched", match: plausible[0]! };
+  return { status: "ambiguous", candidates: samePostcode };
 }
 
 // ─── Sub-handlers ─────────────────────────────────────────────────────────────
@@ -1177,6 +1163,18 @@ async function handleShiftAnalysis(
   const matches: (PharmacyCandidate | undefined)[] = [...resolved];
   for (let i = matches.length; i < groups.length; i++) {
     const group = groups[i]!;
+    if (!hasUsableLocation(group)) {
+      setState(conversationId, {
+        phase: "awaiting_postcode",
+        ext,
+        groups,
+        role,
+        resolved: matches,
+        groupIndex: i,
+      });
+      const label = group.pharmacy_name ? ` for "${group.pharmacy_name}"` : "";
+      return plain(`I need the pharmacy's full postcode${label} so I can verify both its name and location before analysing the shift. What's the postcode?`);
+    }
     const resolution = await resolvePharmacy(conversationId, group);
     if (resolution.status === "ambiguous") {
       setState(conversationId, {
@@ -1190,8 +1188,8 @@ async function handleShiftAnalysis(
       const label = group.pharmacy_name ? `"${group.pharmacy_name}"` : "that pharmacy";
       const area = group.pharmacy_postcode ?? group.pharmacy_address ?? "that area";
       const intro = resolution.candidates.length === 1
-        ? `Found a pharmacy near ${area}, but the name doesn't look like a confident match for ${label} — is this it?`
-        : `Found ${resolution.candidates.length} pharmacies matching ${area} and couldn't tell which one you meant.`;
+        ? `Found a possible pharmacy, but its name and postcode don't both confidently match ${label} near ${area} — is this it?`
+        : `Found ${resolution.candidates.length} possible pharmacies and couldn't confirm both the name and postcode.`;
       const lines = [
         `**Which pharmacy is ${label}?**`,
         "",
@@ -1204,20 +1202,6 @@ async function handleShiftAnalysis(
       return selectPharmacy(
         lines.join("\n"),
         resolution.candidates.map((c) => ({ name: c.name, address: c.address }))
-      );
-    }
-    if (resolution.status === "not_found" && !hasUsableLocation(group)) {
-      setState(conversationId, {
-        phase: "awaiting_postcode",
-        ext,
-        groups,
-        role,
-        resolved: matches,
-        groupIndex: i,
-      });
-      const label = group.pharmacy_name ? `"${group.pharmacy_name}"` : "that pharmacy";
-      return plain(
-        `I couldn't find ${label} and there's no postcode in the message to fall back on — without one I can't place it on the map. What's its postcode? (Reply "skip" to log it anyway without a mappable location.)`
       );
     }
     matches.push(resolution.status === "matched" ? resolution.match : undefined);
@@ -1512,11 +1496,17 @@ export async function processMessage(
 
   // ── Awaiting a postcode (pharmacy not found, message gave no location) ──
   if (state.phase === "awaiting_postcode") {
-    if (/^(none|skip|cancel)\b/i.test(trimmed)) {
-      return handleShiftAnalysis(conversationId, userId, state.ext, state.groups, state.role, [...state.resolved, undefined]);
+    if (/^(cancel|none)\b/i.test(trimmed)) {
+      setState(conversationId, { phase: "idle" });
+      return plain("Shift not analysed or logged because the pharmacy location couldn't be verified.");
+    }
+    const postcode = normalizedPostcode(trimmed);
+    if (!postcode) {
+      return plain(`That doesn't look like a complete UK postcode. Please send the full postcode, e.g. "M9 8DX", or reply "cancel".`);
     }
     const updatedGroups = [...state.groups];
-    updatedGroups[state.groupIndex] = { ...updatedGroups[state.groupIndex]!, pharmacy_postcode: trimmed };
+    const formattedPostcode = `${postcode.slice(0, -3)} ${postcode.slice(-3)}`;
+    updatedGroups[state.groupIndex] = { ...updatedGroups[state.groupIndex]!, pharmacy_postcode: formattedPostcode };
     return handleShiftAnalysis(conversationId, userId, state.ext, updatedGroups, state.role, state.resolved);
   }
 
