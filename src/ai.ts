@@ -77,12 +77,12 @@ type Shift = {
 
 type State =
   | { phase: "idle" }
-  | { phase: "awaiting_confirmation"; pending: PendingShift }
+  | { phase: "awaiting_confirmation"; pending: PendingShift; rateRequired?: boolean }
   | { phase: "awaiting_delete"; shifts: Shift[] }
   // Flat list rather than one shared template + dates — covers both a single
   // pharmacy offered on several dates AND a multi-pharmacy broadcast, since
   // each candidate is already a fully-resolved shift in its own right.
-  | { phase: "awaiting_date_selection"; candidates: PendingShift[] }
+  | { phase: "awaiting_date_selection"; candidates: PendingShift[]; rateRequired?: boolean }
   // A postcode search for one group in the message came back with more than
   // one pharmacy and none was a confident name match — `resolved` carries
   // the matches already settled for earlier groups (undefined where a group
@@ -110,15 +110,12 @@ type State =
       resolved: (PharmacyCandidate | undefined)[];
       groupIndex: number;
     }
-  // The message flagged its own rate as negotiable/TBC with no figure given
-  // — asked before any pharmacy resolution or analysis starts, since the
-  // whole point is to use the REAL agreed rate rather than silently saving
-  // a market-rate guess as if it were the deal that was struck.
+  // The user chose to log a negotiable/TBC shift after seeing its analysis.
+  // Keep the selected candidates here until they provide the real agreed
+  // rate, so the market-rate suggestion is never silently saved as the deal.
   | {
       phase: "awaiting_rate";
-      ext: ShiftExtraction;
-      groups: ShiftGroup[];
-      role: string | null;
+      candidates: PendingShift[];
     };
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
@@ -270,9 +267,8 @@ type ShiftExtraction = {
   // bare missing hourly_rate: that case already shows a market-rate
   // SUGGESTION to counter with (see rateProvided in analyzeGroup) without
   // pretending it's a real number. An explicitly negotiable shift is
-  // different — there's a genuine agreed figure somewhere that just hasn't
-  // been extracted yet, so the bot asks for it upfront rather than silently
-  // saving the benchmark guess as if it were the deal that was struck.
+  // analyzed using that suggestion first; if the user chooses to log it,
+  // the bot then asks for the genuine agreed figure before saving anything.
   rate_negotiable?: boolean | null;
   shift_type?: string;
   break_duration_minutes?: number | null;
@@ -1062,7 +1058,8 @@ async function analyzeGroup(
   if (asapNote) lines.push(asapNote);
 
   if (!rateProvided) {
-    lines.push(`**Rate:** No rate offered — suggested: £${rate}/hr = £${totalPay} for the day`);
+    const missingRateLabel = ext.rate_negotiable === true ? "Rate negotiable" : "No rate offered";
+    lines.push(`**Rate:** ${missingRateLabel} — suggested: £${rate}/hr = £${totalPay} for the day`);
   } else {
     lines.push(`**Rate:** £${rate}/hr = £${totalPay} for the day`);
   }
@@ -1245,11 +1242,19 @@ async function handleShiftAnalysis(
   }
 
   if (candidates.length === 1) {
-    setState(conversationId, { phase: "awaiting_confirmation", pending: candidates[0]! });
+    setState(conversationId, {
+      phase: "awaiting_confirmation",
+      pending: candidates[0]!,
+      rateRequired: ext.rate_negotiable === true && ext.hourly_rate == null,
+    });
     return confirmShift(lines.join("\n"));
   }
 
-  setState(conversationId, { phase: "awaiting_date_selection", candidates });
+  setState(conversationId, {
+    phase: "awaiting_date_selection",
+    candidates,
+    rateRequired: ext.rate_negotiable === true && ext.hourly_rate == null,
+  });
   lines.push("");
   lines.push("**WHICH SHIFTS DO YOU WANT TO LOG?**");
   candidates.forEach((c, i) =>
@@ -1374,6 +1379,21 @@ async function handleSaveShifts(
   return plain(lines.join("\n"));
 }
 
+async function handleAcceptedCandidates(
+  conversationId: string,
+  userId: string,
+  candidates: PendingShift[],
+  rateRequired: boolean
+): Promise<BotReply> {
+  if (rateRequired) {
+    setState(conversationId, { phase: "awaiting_rate", candidates });
+    return plain(`What £/hr rate did you agree with the pharmacy? For example, reply "£32". (Or reply "cancel" to skip logging.)`);
+  }
+  return candidates.length === 1
+    ? handleSaveShift(conversationId, userId, candidates[0]!)
+    : handleSaveShifts(conversationId, userId, candidates);
+}
+
 async function handleListShiftsForDelete(conversationId: string, userId: string): Promise<BotReply> {
   const data = await botFetch<{ shifts?: Shift[] }>(
     `/shifts?auth_user_id=${encodeURIComponent(userId)}&upcoming=true`
@@ -1425,7 +1445,7 @@ export async function processMessage(
   // ── Awaiting YES/NO ──────────────────────────────────────────────────────
   if (state.phase === "awaiting_confirmation") {
     if (/^(yes|y|confirm|log|accept|ok|sure|yep|yeah)\b/i.test(trimmed)) {
-      return handleSaveShift(conversationId, userId, state.pending);
+      return handleAcceptedCandidates(conversationId, userId, [state.pending], state.rateRequired === true);
     }
     if (/^(no|n|decline|skip|nope|cancel|pass)\b/i.test(trimmed)) {
       setState(conversationId, { phase: "idle" });
@@ -1454,11 +1474,16 @@ export async function processMessage(
       return plain("No shifts logged. Send another shift offer whenever you're ready.");
     }
     if (/^all\b/.test(lower)) {
-      return handleSaveShifts(conversationId, userId, state.candidates);
+      return handleAcceptedCandidates(conversationId, userId, state.candidates, state.rateRequired === true);
     }
     const indices = parseDateSelection(trimmed, state.candidates.length);
     if (indices) {
-      return handleSaveShifts(conversationId, userId, indices.map((i) => state.candidates[i - 1]!));
+      return handleAcceptedCandidates(
+        conversationId,
+        userId,
+        indices.map((i) => state.candidates[i - 1]!),
+        state.rateRequired === true
+      );
     }
     if (looksLikeFailedSelection(trimmed)) {
       return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.candidates.length} (e.g. "1,3"), "all", or "none".`);
@@ -1495,16 +1520,20 @@ export async function processMessage(
     return handleShiftAnalysis(conversationId, userId, state.ext, updatedGroups, state.role, state.resolved);
   }
 
-  // ── Awaiting the agreed rate (message flagged it as negotiable) ─────────
+  // ── Awaiting the agreed rate after the user chose to log ────────────────
   if (state.phase === "awaiting_rate") {
-    if (/^(skip|not sure|tbc|don'?t know)\b/i.test(trimmed)) {
-      return handleShiftAnalysis(conversationId, userId, state.ext, state.groups, state.role);
+    if (/^(cancel|skip|none|not sure|tbc|don'?t know)\b/i.test(trimmed)) {
+      setState(conversationId, { phase: "idle" });
+      return plain("Shift not logged. Send another shift offer whenever you're ready.");
     }
     const stated = parseStatedRate(trimmed);
     if (stated == null) {
-      return plain(`I couldn't work out a rate from that — what's the £/hr you agreed, e.g. "£32"? (Or reply "skip".)`);
+      return plain(`I couldn't work out a rate from that — what's the £/hr you agreed, e.g. "£32"? (Or reply "cancel".)`);
     }
-    return handleShiftAnalysis(conversationId, userId, { ...state.ext, hourly_rate: stated }, state.groups, state.role);
+    const candidates = state.candidates.map((candidate) => ({ ...candidate, hourly_rate: stated }));
+    return candidates.length === 1
+      ? handleSaveShift(conversationId, userId, candidates[0]!)
+      : handleSaveShifts(conversationId, userId, candidates);
   }
 
   // ── Pro check ───────────────────────────────────────────────────────────
@@ -1565,13 +1594,6 @@ export async function processMessage(
       }
     }
     return plain("I couldn't work out the date, start time and end time for that shift — could you fill that in?");
-  }
-
-  if (ext.rate_negotiable === true && ext.hourly_rate == null) {
-    setState(conversationId, { phase: "awaiting_rate", ext, groups, role });
-    return plain(
-      `This shift's rate is negotiable — what did you agree with the pharmacy? (Reply "skip" to see a suggested market rate instead of logging a firm figure.)`
-    );
   }
 
   console.log(
