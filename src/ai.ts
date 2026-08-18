@@ -473,7 +473,7 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
     // tokens of JSON — 400 was tight enough that real broadcasts got cut off
     // mid-string, which fails JSON.parse and silently drops to intent
     // "other" with no explanation to the user.
-    max_tokens: 1000,
+    max_completion_tokens: 1000,
     messages: [
       {
         role: "system",
