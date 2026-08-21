@@ -196,7 +196,7 @@ async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
   }
 }
 
-async function calendarConflicts(userId: string, shift: PendingShift): Promise<CalendarConflict[]> {
+async function calendarConflicts(userId: string, shift: PendingShift): Promise<CalendarConflict[] | null> {
   try {
     const result = await botFetch<{ conflicts?: CalendarConflict[] }>("/calendar-conflicts", {
       method: "POST",
@@ -210,7 +210,7 @@ async function calendarConflicts(userId: string, shift: PendingShift): Promise<C
     return result.conflicts ?? [];
   } catch (error) {
     console.error("Calendar conflict check failed", error);
-    return [];
+    return null;
   }
 }
 
@@ -1352,8 +1352,9 @@ async function handleShiftAnalysis(
     lines.push("", `**Also noted:** ${ext.recurring_availability} — send a specific date when one comes up and I'll analyse it.`);
   }
 
+  const calendarCheckFailed = conflicts.some((items) => items === null);
   const overlapping = conflicts.flatMap((items, index) =>
-    items.map((conflict) => ({ candidate: candidates[index]!, conflict }))
+    (items ?? []).map((conflict) => ({ candidate: candidates[index]!, conflict }))
   );
   if (overlapping.length) {
     lines.push("", "**CALENDAR CHECK**");
@@ -1362,8 +1363,15 @@ async function handleShiftAnalysis(
       lines.push(`${datePrefix}${conflictLine(conflict)}`);
     }
     lines.push("", "Any overlapping shift cannot be logged until the clash is resolved.");
+  } else if (calendarCheckFailed) {
+    lines.push("", "**Calendar:** I couldn't verify your booked Locum1st shifts right now. Nothing will be logged until the calendar check succeeds.");
   } else {
     lines.push("", "**Calendar:** No overlapping shifts are booked in Locum1st.");
+  }
+
+  if (calendarCheckFailed) {
+    await setState(conversationId, userId, { phase: "idle" });
+    return plain(lines.join("\n"));
   }
 
   if (candidates.length === 1) {
