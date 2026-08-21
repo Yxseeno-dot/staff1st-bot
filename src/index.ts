@@ -1,26 +1,22 @@
 import "dotenv/config";
 import * as Sentry from "@sentry/node";
 import http from "http";
-import { query, execute } from "./db.js";
+import { config } from "./config.js";
+import { checkDatabase, closeDatabase, execute, query, queryOne, withTransaction, type DbClient } from "./db.js";
 import { processMessage, type BotReply } from "./ai.js";
+import { cleanupWorkflows } from "./workflows.js";
 
-if (process.env.SENTRY_DSN) {
-  Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.1 });
-}
-
-const BOT_USER_ID = process.env.BOT_USER_ID!;
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS ?? "30000", 10);
-const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const CENTRIFUGO_URL = process.env.CENTRIFUGO_URL!;
-const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY!;
-
-if (!BOT_USER_ID) {
-  console.error("BOT_USER_ID is required.");
-  process.exit(1);
-}
-if (!CENTRIFUGO_URL || !CENTRIFUGO_API_KEY) {
-  console.error("CENTRIFUGO_URL and CENTRIFUGO_API_KEY are required.");
-  process.exit(1);
+if (config.sentryDsn) {
+  Sentry.init({
+    dsn: config.sentryDsn,
+    environment: process.env.NODE_ENV ?? "production",
+    release: process.env.APP_VERSION,
+    tracesSampleRate: 0.1,
+    beforeSend(event) {
+      if (event.request) delete event.request.data;
+      return event;
+    },
+  });
 }
 
 type UnprocessedMessage = {
@@ -30,188 +26,259 @@ type UnprocessedMessage = {
   user_id: string;
 };
 
-const inFlight = new Set<string>();
-const inFlightConvos = new Set<string>();
+type OutboxItem = { id: string; channel: string; payload: unknown; attempts: number };
+
+let activeJobs = 0;
+let shuttingDown = false;
+let lastPollAt: string | null = null;
+let lastPollError: string | null = null;
 const MIN_TYPING_MS = 900;
+const PROCESS_TIMEOUT_MS = 45_000;
+const PUBLISH_TIMEOUT_MS = 10_000;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Rejects with `label` after `ms` if `promise` hasn't settled — a safety net
-// so a hang anywhere inside processMessage() (a stalled DB query, a stuck
-// upstream call we didn't anticipate) can't keep the typing-ping interval in
-// handleMessage() alive forever. This doesn't cancel the original promise —
-// Node can't cancel arbitrary work — it just stops waiting on it so the bot
-// can send a fallback reply and move on to the next message.
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (err) => { clearTimeout(timer); reject(err); }
-    );
-  });
-}
-
-const PUBLISH_TIMEOUT_MS = 10_000;
-
 async function publish(channel: string, data: unknown): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PUBLISH_TIMEOUT_MS);
   try {
-    const res = await fetch(`${CENTRIFUGO_URL}/api/publish`, {
+    const response = await fetch(`${config.centrifugoUrl}/api/publish`, {
       method: "POST",
-      headers: { "X-API-Key": CENTRIFUGO_API_KEY, "Content-Type": "application/json" },
+      headers: { "X-API-Key": config.centrifugoApiKey, "Content-Type": "application/json" },
       body: JSON.stringify({ channel, data }),
       signal: controller.signal,
     });
-    if (!res.ok) {
-      throw new Error(`Centrifugo publish failed: ${res.status} ${await res.text()}`);
-    }
+    if (!response.ok) throw new Error(`Centrifugo publish failed: ${response.status}`);
   } finally {
     clearTimeout(timer);
   }
 }
 
-// The bot's actual reply is only ever pushed live once — unlike the typing
-// ping (best-effort, repeated every 3s, failures silently dropped), a single
-// failed publish here means the reply sits in the DB but is never delivered
-// live; the message is already marked processed by the time this runs, so
-// nothing retries it later. Retry a few times before giving up so a
-// transient Centrifugo/network blip doesn't silently strand a reply.
-async function publishWithRetry(channel: string, data: unknown, attempts = 3): Promise<void> {
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      await publish(channel, data);
-      return;
-    } catch (err) {
-      if (i === attempts) throw err;
-      console.error(`[publish] Attempt ${i}/${attempts} failed, retrying:`, err);
-      await sleep(500 * i);
+async function claimMessages(limit: number): Promise<UnprocessedMessage[]> {
+  return withTransaction(async (client) => {
+    const rows = await query<UnprocessedMessage>(
+      `WITH candidates AS (
+         SELECT m.id
+         FROM locum1st.messages m
+         JOIN locum1st.conversations c ON c.id = m.conversation_id
+         WHERE m.bot_processed = false
+           AND m.sender_id <> $1
+           AND (c.participant_a = $1 OR c.participant_b = $1)
+           AND (m.bot_claimed_at IS NULL OR m.bot_claimed_at < now() - interval '2 minutes')
+           AND NOT EXISTS (
+             SELECT 1 FROM locum1st.messages earlier
+             WHERE earlier.conversation_id = m.conversation_id
+               AND earlier.bot_processed = false
+               AND (earlier.created_at, earlier.id) < (m.created_at, m.id)
+           )
+         ORDER BY m.created_at, m.id
+         FOR UPDATE OF m SKIP LOCKED
+         LIMIT $3
+       )
+       UPDATE locum1st.messages m
+       SET bot_claimed_at = now(), bot_claimed_by = $2, bot_attempts = bot_attempts + 1
+       FROM candidates x, locum1st.conversations c
+       WHERE m.id = x.id AND c.id = m.conversation_id
+       RETURNING m.id::text, m.conversation_id::text, m.text,
+         CASE WHEN c.participant_a = $1 THEN c.participant_b ELSE c.participant_a END AS user_id`,
+      [config.botUserId, config.workerId, limit],
+      client
+    );
+    return rows;
+  });
+}
+
+async function persistReply(msg: UnprocessedMessage, reply: BotReply) {
+  return withTransaction(async (client) => {
+    const stored = await queryOne<{
+      id: string; conversation_id: string; sender_id: string; text: string;
+      metadata: unknown; delivered_at: string | null; read_at: string | null; created_at: string;
+    }>(
+      `INSERT INTO locum1st.messages (conversation_id, sender_id, text, metadata, bot_processed)
+       VALUES ($1, $2, $3, $4, true)
+       RETURNING id::text, conversation_id::text, sender_id, text, metadata,
+         delivered_at::text, read_at::text, created_at::text`,
+      [msg.conversation_id, config.botUserId, reply.text, reply.metadata ?? null],
+      client
+    );
+    if (!stored) throw new Error("Bot reply insert returned no row");
+
+    await execute(
+      `UPDATE locum1st.conversations SET last_message_at = $2, last_message_preview = $3 WHERE id = $1`,
+      [msg.conversation_id, stored.created_at, `Bot: ${reply.text.slice(0, 100)}`],
+      client
+    );
+    await execute(
+      `UPDATE locum1st.messages
+       SET bot_processed = true, bot_claimed_at = NULL, bot_claimed_by = NULL
+       WHERE id = $1 AND bot_claimed_by = $2`,
+      [msg.id, config.workerId],
+      client
+    );
+    if (reply.workflowStatus) {
+      await execute(
+        `UPDATE locum1st.bot_workflows
+         SET status = $3, phase = 'idle', payload = '{"phase":"idle"}'::jsonb,
+             updated_at = now(), version = version + 1
+         WHERE conversation_id = $1 AND auth_user_id = $2 AND status = 'active'`,
+        [msg.conversation_id, msg.user_id, reply.workflowStatus],
+        client
+      );
     }
-  }
+    await execute(
+      `INSERT INTO locum1st.bot_outbox (channel, payload) VALUES ($1, $2)`,
+      [`conversation:${msg.conversation_id}`, JSON.stringify(stored)],
+      client
+    );
+    return stored;
+  });
 }
 
 async function handleMessage(msg: UnprocessedMessage) {
-  console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] ${msg.user_id}: ${msg.text.slice(0, 100)}`);
-
+  const context = { conversationId: msg.conversation_id, messageId: msg.id };
+  console.log("[message] processing", context);
   const channel = `conversation:${msg.conversation_id}`;
-  const sendTyping = () => publish(channel, { type: "typing", senderId: BOT_USER_ID }).catch(() => {});
+  const sendTyping = () => publish(channel, { type: "typing", senderId: config.botUserId }).catch(() => undefined);
   const startedAt = Date.now();
   sendTyping();
-  // Keep the typing indicator alive for as long as the AI call takes — the
-  // client clears it after a few seconds of silence, so re-ping periodically.
-  const typingHeartbeat = setInterval(sendTyping, 3000);
+  const typingHeartbeat = setInterval(sendTyping, 3_000);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error(`Processing timed out after ${PROCESS_TIMEOUT_MS}ms`)), PROCESS_TIMEOUT_MS);
 
   let reply: BotReply;
   try {
-    reply = await withTimeout(
-      processMessage(msg.conversation_id, msg.user_id, msg.text, msg.id),
-      45_000,
-      "processMessage"
-    );
-  } catch (err) {
-    console.error(`[convo-${msg.conversation_id}] Error:`, err);
-    Sentry.captureException(err);
+    reply = await processMessage(msg.conversation_id, msg.user_id, msg.text, msg.id, controller.signal);
+  } catch (error) {
+    console.error("[message] processing failed", context, error);
+    Sentry.captureException(error, { contexts: { message: context } });
     reply = { text: "Sorry, I hit an error processing that. Please try again." };
   } finally {
+    clearTimeout(timeout);
     clearInterval(typingHeartbeat);
   }
 
-  // The bot often replies in well under a second — too fast for the typing
-  // indicator to ever paint a frame before the real message replaces it.
-  // Pad out to a minimum "thinking" duration so the animation is actually
-  // visible instead of flashing on and off within the same render tick.
   const elapsed = Date.now() - startedAt;
-  if (elapsed < MIN_TYPING_MS) {
-    await sleep(MIN_TYPING_MS - elapsed);
-  }
-
-  await execute(
-    `INSERT INTO locum1st.messages (conversation_id, sender_id, text, metadata)
-     VALUES ($1, $2, $3, $4)`,
-    [msg.conversation_id, BOT_USER_ID, reply.text, reply.metadata ?? null]
-  );
-
-  await execute(
-    `UPDATE locum1st.conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
-    [msg.conversation_id, `Bot: ${reply.text.slice(0, 100)}`]
-  );
-
-  // Mark processed before publishing so a Centrifugo failure doesn't cause a
-  // duplicate reply on the next poll. The client re-fetches messages on reconnect.
-  await execute(`UPDATE locum1st.messages SET bot_processed = true WHERE id = $1`, [msg.id]);
-
-  await publishWithRetry(channel, {
-    conversation_id: msg.conversation_id,
-    sender_id: BOT_USER_ID,
-    text: reply.text,
-    metadata: reply.metadata ?? null,
-    created_at: new Date().toISOString(),
-  });
-  console.log(`[${new Date().toISOString()}] [convo-${msg.conversation_id}] Bot replied.`);
+  if (elapsed < MIN_TYPING_MS) await sleep(MIN_TYPING_MS - elapsed);
+  const stored = await persistReply(msg, reply);
+  console.log("[message] completed", { ...context, replyId: stored.id });
 }
 
-async function pollMessages() {
+async function processAvailableMessages() {
+  if (shuttingDown) return;
+  const capacity = Math.max(0, config.workerConcurrency - activeJobs);
+  if (!capacity) return;
   try {
-    const rows = await query<UnprocessedMessage>(
-      `SELECT m.id, m.conversation_id, m.text,
-              CASE WHEN c.participant_a = $1 THEN c.participant_b ELSE c.participant_a END AS user_id
-       FROM locum1st.messages m
-       JOIN locum1st.conversations c ON c.id = m.conversation_id
-       WHERE m.bot_processed = false
-         AND m.sender_id <> $1
-         AND (c.participant_a = $1 OR c.participant_b = $1)
-       ORDER BY m.created_at ASC`,
-      [BOT_USER_ID]
-    );
-
-    for (const row of rows) {
-      if (inFlight.has(row.id)) continue;
-      if (inFlightConvos.has(row.conversation_id)) continue;
-      inFlight.add(row.id);
-      inFlightConvos.add(row.conversation_id);
-      handleMessage(row)
-        .catch((err) => {
-          console.error(`[convo-${row.conversation_id}] Failed to handle message:`, err);
-          Sentry.captureException(err);
+    const messages = await claimMessages(capacity);
+    lastPollAt = new Date().toISOString();
+    lastPollError = null;
+    for (const message of messages) {
+      activeJobs++;
+      void handleMessage(message)
+        .catch(async (error) => {
+          console.error("[message] handler failed", { conversationId: message.conversation_id, messageId: message.id }, error);
+          Sentry.captureException(error);
+          await execute(
+            `UPDATE locum1st.messages SET bot_claimed_at = NULL, bot_claimed_by = NULL
+             WHERE id = $1 AND bot_claimed_by = $2`,
+            [message.id, config.workerId]
+          ).catch(() => undefined);
         })
-        .finally(() => {
-          inFlight.delete(row.id);
-          inFlightConvos.delete(row.conversation_id);
-        });
+        .finally(() => { activeJobs--; });
     }
-  } catch (err) {
-    console.error("Poll error:", err);
-    Sentry.captureException(err);
+  } catch (error) {
+    lastPollError = error instanceof Error ? error.message : "Unknown poll error";
+    console.error("[poll] failed", error);
+    Sentry.captureException(error);
+  }
+}
+
+async function claimOutbox(limit = 20): Promise<OutboxItem[]> {
+  return withTransaction(async (client: DbClient) => query<OutboxItem>(
+    `WITH candidates AS (
+       SELECT id FROM locum1st.bot_outbox
+       WHERE published_at IS NULL AND available_at <= now()
+         AND (claimed_at IS NULL OR claimed_at < now() - interval '1 minute')
+       ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $2
+     )
+     UPDATE locum1st.bot_outbox o
+     SET claimed_at = now(), claimed_by = $1, attempts = attempts + 1
+     FROM candidates c WHERE o.id = c.id
+     RETURNING o.id::text, o.channel, o.payload, o.attempts`,
+    [config.workerId, limit],
+    client
+  ));
+}
+
+async function flushOutbox() {
+  if (shuttingDown) return;
+  const items = await claimOutbox().catch((error) => {
+    console.error("[outbox] claim failed", error);
+    return [] as OutboxItem[];
+  });
+  for (const item of items) {
+    try {
+      await publish(item.channel, item.payload);
+      await execute(`UPDATE locum1st.bot_outbox SET published_at = now(), claimed_at = NULL, claimed_by = NULL, last_error = NULL WHERE id = $1`, [item.id]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : "Publish failed";
+      const backoffSeconds = Math.min(300, 2 ** Math.min(item.attempts, 8));
+      await execute(
+        `UPDATE locum1st.bot_outbox SET claimed_at = NULL, claimed_by = NULL, last_error = $2,
+           available_at = now() + ($3 * interval '1 second') WHERE id = $1`,
+        [item.id, message, backoffSeconds]
+      );
+    }
   }
 }
 
 function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", inFlight: inFlight.size }));
-    } else {
-      res.writeHead(404);
-      res.end();
+  return http.createServer(async (req, res) => {
+    if (req.url !== "/health" && req.url !== "/ready") {
+      res.writeHead(404).end();
+      return;
     }
-  });
-  server.listen(PORT, () => console.log(`[Staff1stBot] Health server on :${PORT}`));
+    const database = await checkDatabase();
+    const ready = database && !shuttingDown && !lastPollError;
+    const status = req.url === "/ready" && !ready ? 503 : 200;
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: ready ? "ok" : "degraded", database, activeJobs, lastPollAt }));
+  }).listen(config.port, () => console.log(`[Staff1stBot] Health server on :${config.port}`));
 }
 
 async function main() {
-  console.log(`[Staff1stBot] Starting — userId: ${BOT_USER_ID}`);
-  startHealthServer();
-  await pollMessages();
-  setInterval(() => pollMessages(), POLL_INTERVAL);
-  console.log(`[Staff1stBot] Ready. Polling every ${POLL_INTERVAL / 1000}s.`);
+  console.log("[Staff1stBot] Starting", { workerId: config.workerId, concurrency: config.workerConcurrency });
+  const server = startHealthServer();
+  await processAvailableMessages();
+  await flushOutbox();
+  const pollTimer = setInterval(() => void processAvailableMessages(), config.pollIntervalMs);
+  const outboxTimer = setInterval(() => void flushOutbox(), 1_000);
+  const cleanupTimer = setInterval(() => void cleanupWorkflows().catch((error) => console.error("[workflow] cleanup failed", error)), 60 * 60 * 1_000);
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Staff1stBot] ${signal}; shutting down`);
+    clearInterval(pollTimer);
+    clearInterval(outboxTimer);
+    clearInterval(cleanupTimer);
+    server.close();
+    const deadline = Date.now() + 15_000;
+    while (activeJobs > 0 && Date.now() < deadline) await sleep(100);
+    await Sentry.flush(2_000);
+    await closeDatabase();
+    process.exit(activeJobs > 0 ? 1 : 0);
+  };
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  console.log(`[Staff1stBot] Ready. Polling every ${config.pollIntervalMs}ms.`);
 }
 
-main().catch(async (err) => {
-  console.error("[Staff1stBot] Fatal:", err);
-  Sentry.captureException(err);
-  await Sentry.flush(2000);
+main().catch(async (error) => {
+  console.error("[Staff1stBot] Fatal", error);
+  Sentry.captureException(error);
+  await Sentry.flush(2_000);
+  await closeDatabase().catch(() => undefined);
   process.exit(1);
 });

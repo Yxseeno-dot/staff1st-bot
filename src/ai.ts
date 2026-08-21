@@ -1,5 +1,10 @@
 import OpenAI from "openai";
+import { z } from "zod";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execute, query } from "./db.js";
+import { config } from "./config.js";
+import { finishWorkflow, loadWorkflow, saveWorkflow } from "./workflows.js";
+import { looksLikeExpiredActionReply, shiftSaveIdentity } from "./domain.js";
 
 // Force Node's native fetch instead of the SDK's bundled node-fetch v2, which has a
 // known intermittent ERR_STREAM_PREMATURE_CLOSE bug on gzip-compressed responses.
@@ -7,18 +12,15 @@ import { execute, query } from "./db.js";
 // unbounded from a chat UX perspective — a stalled OpenAI response would hang
 // processMessage() forever, leaving the bot's "typing" heartbeat running
 // indefinitely (see botFetch below for the matching issue on our own API calls).
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch, timeout: 20_000 });
-const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
-const FALLBACK_MODEL = process.env.OPENAI_FALLBACK_MODEL ?? "gpt-4o-mini";
-
-const BEARER = process.env.BOT_API_BEARER;
-if (!BEARER) throw new Error("BOT_API_BEARER is required");
-const BASE = process.env.BOT_API_BASE ?? "https://locum1st.net/api/bot";
-
-const BOT_USER_ID = process.env.BOT_USER_ID;
-if (!BOT_USER_ID) throw new Error("BOT_USER_ID is required");
+const client = new OpenAI({ apiKey: config.openAiApiKey, fetch: globalThis.fetch, timeout: 20_000 });
+const MODEL = config.openAiModel;
+const FALLBACK_MODEL = config.openAiFallbackModel;
+const BEARER = config.botApiBearer;
+const BASE = config.botApiBase;
+const BOT_USER_ID = config.botUserId;
 
 const HISTORY_LIMIT = 5;
+const abortContext = new AsyncLocalStorage<AbortSignal>();
 
 // UK-local calendar date, not the server's (likely UTC) date. The UK is
 // always UTC+0 or UTC+1, never behind — so a plain `new Date().toISOString()`
@@ -39,6 +41,7 @@ export type BotMetadata = { [k: string]: JsonVal };
 export type BotReply = {
   text: string;
   metadata?: BotMetadata;
+  workflowStatus?: "completed" | "cancelled";
 };
 
 // Everything about an offered shift except which date(s) it applies to — a
@@ -61,7 +64,15 @@ type ShiftTemplate = {
   travel_allowance_fixed?: number;
 };
 
-type PendingShift = ShiftTemplate & { shift_date: string };
+type PendingShift = ShiftTemplate & { shift_date: string; proposal_id: string };
+
+type CalendarConflict = {
+  source: "locum1st";
+  title: string;
+  shift_date: string;
+  start_time: string;
+  end_time: string;
+};
 
 type PharmacyCandidate = { odsCode: string; name: string; address: string; postcode?: string };
 
@@ -118,31 +129,15 @@ type State =
       candidates: PendingShift[];
     };
 
-// ─── In-memory state ──────────────────────────────────────────────────────────
+// ─── Durable workflow state ──────────────────────────────────────────────────
 
-const STATE_TTL_MS = 10 * 60 * 1000;
-type StateEntry = { state: State; lastActivity: number };
-const states = new Map<string, StateEntry>();
-
-function getState(conversationId: string): State {
-  const entry = states.get(conversationId);
-  if (!entry || Date.now() - entry.lastActivity > STATE_TTL_MS) {
-    states.delete(conversationId);
-    return { phase: "idle" };
+async function setState(conversationId: string, userId: string, state: State): Promise<string | null> {
+  if (state.phase === "idle") {
+    await finishWorkflow(conversationId, userId);
+    return null;
   }
-  return entry.state;
+  return saveWorkflow(conversationId, userId, state);
 }
-
-function setState(conversationId: string, state: State): void {
-  states.set(conversationId, { state, lastActivity: Date.now() });
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, entry] of states) {
-    if (now - entry.lastActivity > STATE_TTL_MS) states.delete(id);
-  }
-}, STATE_TTL_MS).unref();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -160,6 +155,12 @@ function selectPharmacy(text: string, candidates: Array<{ name: string; address:
 
 const BOT_FETCH_TIMEOUT_MS = 15_000;
 
+class BotApiError extends Error {
+  constructor(public status: number, public data: unknown, path: string) {
+    super(`Bot API error ${status} for ${path}`);
+  }
+}
+
 // Without a timeout, a stalled upstream response (Locum1st's API, or Google
 // Maps inside its /distance route) leaves processMessage() awaiting forever —
 // which means handleMessage()'s typing-ping interval (index.ts) never reaches
@@ -176,11 +177,13 @@ async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
         "Content-Type": "application/json",
         ...(options?.headers ?? {}),
       },
-      signal: controller.signal,
+      signal: abortContext.getStore()
+        ? AbortSignal.any([controller.signal, abortContext.getStore()!])
+        : controller.signal,
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`Bot API error ${res.status} for ${path}: ${body}`);
+      const body: unknown = await res.json().catch(() => null);
+      throw new BotApiError(res.status, body, path);
     }
     return (await res.json()) as T;
   } catch (err) {
@@ -191,6 +194,28 @@ async function botFetch<T>(path: string, options?: RequestInit): Promise<T> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function calendarConflicts(userId: string, shift: PendingShift): Promise<CalendarConflict[]> {
+  try {
+    const result = await botFetch<{ conflicts?: CalendarConflict[] }>("/calendar-conflicts", {
+      method: "POST",
+      body: JSON.stringify({
+        auth_user_id: userId,
+        shift_date: shift.shift_date,
+        start_time: shift.start_time,
+        end_time: shift.end_time,
+      }),
+    });
+    return result.conflicts ?? [];
+  } catch (error) {
+    console.error("Calendar conflict check failed", error);
+    return [];
+  }
+}
+
+function conflictLine(conflict: CalendarConflict): string {
+  return `⚠ **Overlap:** ${conflict.title}, ${conflict.start_time.slice(0, 5)}–${conflict.end_time.slice(0, 5)} (booked in Locum1st)`;
 }
 
 // ─── Shift extraction via LLM ─────────────────────────────────────────────────
@@ -229,7 +254,7 @@ type ShiftGroup = {
 // "cancelled"/"shift" together (e.g. "previous rota cancelled, new shift
 // below"). The model has full conversation history to work with, which the
 // regexes never did.
-type Intent = "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other";
+type Intent = "shift_offer" | "cancel_shift" | "show_shifts" | "analyse_shifts" | "greeting" | "other";
 
 type ShiftExtraction = {
   intent: Intent;
@@ -294,6 +319,49 @@ type ShiftExtraction = {
   // principled end date to expand it to; see extractShift's prompt.
   recurring_availability?: string | null;
 };
+
+const nullableString = z.string().trim().min(1).nullable().optional();
+const nullableNumber = z.number().finite().nullable().optional();
+const nullableBoolean = z.boolean().nullable().optional();
+const optionalStringFromNull = z.string().nullish().transform((value) => value ?? undefined);
+const optionalTimeFromNull = z.string().regex(/^\d{2}:\d{2}$/).nullish().transform((value) => value ?? undefined);
+const optionalDatesFromNull = z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).max(100).nullish().transform((value) => value ?? undefined);
+const shiftGroupSchema = z.object({
+  pharmacy_name: nullableString,
+  pharmacy_postcode: nullableString,
+  pharmacy_address: nullableString,
+  shift_dates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).max(100).optional(),
+  start_time: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
+  end_time: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
+  start_asap: nullableBoolean,
+}).passthrough();
+
+const shiftExtractionSchema = z.object({
+  intent: z.enum(["shift_offer", "cancel_shift", "show_shifts", "analyse_shifts", "greeting", "other"]),
+  already_occurred: nullableBoolean,
+  dates_explicit_year: nullableBoolean,
+  groups: z.array(shiftGroupSchema).max(50).optional(),
+  pharmacy_name: optionalStringFromNull,
+  pharmacy_postcode: optionalStringFromNull,
+  pharmacy_address: optionalStringFromNull,
+  shift_dates: optionalDatesFromNull,
+  start_time: optionalTimeFromNull,
+  end_time: optionalTimeFromNull,
+  start_asap: nullableBoolean,
+  hourly_rate: nullableNumber,
+  rate_negotiable: nullableBoolean,
+  shift_type: optionalStringFromNull,
+  break_duration_minutes: nullableNumber,
+  break_paid: z.boolean().optional(),
+  mileage_paid: z.boolean().optional(),
+  mileage_pence_per_mile: nullableNumber,
+  mileage_threshold_miles: nullableNumber,
+  mileage_cap_miles: nullableNumber,
+  travel_allowance_fixed: nullableNumber,
+  travel_hours_paid: nullableNumber,
+  pmr_system: nullableString,
+  recurring_availability: nullableString,
+}).passthrough();
 
 // A grace window on "already passed this year" — a date up to this many
 // calendar months before today reads as a recent backdated shift ("14 May"
@@ -468,12 +536,13 @@ async function extractShift(text: string, history: HistoryTurn[]): Promise<Shift
         content: `You're the message handler for a locum pharmacist's shift-tracking bot. Classify the CURRENT message's intent and, if it's a shift offer, extract its details. Return JSON.
 Recent conversation history is provided for context (e.g. shift details split across several messages, or a follow-up like "actually make it 8am") — the CURRENT message is the last one; prior ones are context only, do not re-report a shift that was already fully extracted and confirmed earlier unless the current message adds to or changes it.
 First decide "intent" — one of:
-- "shift_offer": the message is offering, describing, or forwarding one or more concrete shifts at a pharmacy — a broadcast, a rota, or a single shift. This includes messages that also happen to mention words like "cancelled" or "removed" in passing (e.g. "previous rota cancelled, new shift below") — that's still a shift offer, not a cancel request. It ALSO includes the locum describing a shift they already worked, for their own record ("I did a shift at Boots Tuesday", "worked 9-5 at Lloyds yesterday, £25/hr") — set already_occurred: true for these (see below); it's the same extraction, just already in the past rather than upcoming.
+- "shift_offer": the message is offering, describing, forwarding, OR beginning a request to add/log one or more shifts — including an incomplete opener such as "I want to add a shift". A broadcast, rota, single shift, and details supplied conversationally all belong here. This includes messages that also happen to mention words like "cancelled" or "removed" in passing (e.g. "previous rota cancelled, new shift below") — that's still a shift offer, not a cancel request. It ALSO includes the locum describing a shift they already worked, for their own record ("I did a shift at Boots Tuesday", "worked 9-5 at Lloyds yesterday, £25/hr") — set already_occurred: true for these (see below); it's the same extraction, just already in the past rather than upcoming.
 - "cancel_shift": the sender (the locum) wants to cancel/delete/remove a shift THEY have already logged with Locum1st — not a shift offer describing some other change.
 - "show_shifts": the sender wants to see their own logged/upcoming shifts.
+- "analyse_shifts": the sender asks a question about their PREVIOUS logged shifts, earnings, rates, hours, pharmacies, working patterns, busiest days/months, or trends. Examples: "where do I work most?", "what's my average rate?", "analyse my last shifts", "am I earning more lately?".
 - "greeting": a greeting, or a general "what can you do"/help question, with no specific shift or account action attached.
 - "other": anything else that doesn't fit the above — chit-chat, an unrelated question, or unclear intent.
-Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise.
+Only fill in the shift fields below (groups/pharmacy_name/shift_dates/etc.) when intent is "shift_offer" — leave them null/omitted otherwise. If the assistant just asked for a missing shift detail and the current message supplies it (even a short reply such as "Tuesday", "9 to 5", "Boots in Leeds", or "£32"), classify it as "shift_offer" and merge the relevant earlier user details from history into one complete extraction.
 Today is ${today}, a ${todayWeekday}. Convert relative or informal dates to YYYY-MM-DD using today as the reference — "tomorrow", "next Tue", "this Sat", and bare day names like "Wednesday" should all resolve to a specific date, not be left null just because they're not already in YYYY-MM-DD form. Work out the date-to-weekday mapping carefully from today's weekday above rather than guessing — a date you output must actually fall on the weekday named in the text, if one was given. A day+month with NO year stated (e.g. "14 June") — ALWAYS use the CURRENT year (${today.slice(0, 4)}) in shift_dates, and set dates_explicit_year: false. Do NOT try to work out yourself whether it "really means" this year or next year — that determination happens outside this step using already_occurred and how far away the date is, not by you guessing here. Your only job for a bare date is: current year, always. If the text DOES give an explicit year in any form ("14 June 2025", "14/06/2027", "2026-06-14"), use exactly that year and set dates_explicit_year: true — those are never adjusted afterwards, so get the stated year right.
 Parse informal or 12-hour times too — "9am", "9:00am", "09:00", "nine o'clock", "9-5" (meaning 09:00-17:00) should all convert to 24h HH:MM.
 If the start is "ASAP", "now", "immediately", or similar — i.e. NO actual clock time is given for the start — set start_asap: true and leave start_time null. Do NOT invent a plausible-looking clock time; you have no way to know when the locum can actually get there, and a made-up time would misstate the shift's real length.
@@ -484,7 +553,7 @@ Distinguish this from OPEN-ENDED standing availability with no end date — e.g.
 If the message offers shifts at MORE THAN ONE DISTINCT PHARMACY (different names/addresses, each with its own date(s) and/or times — e.g. a multi-branch broadcast like "13 July: Prescot Road ... / 30 July: Moreton ..."), put one object per pharmacy in the "groups" array instead of using the top-level pharmacy_name/shift_dates/start_time/end_time fields — leave those top-level fields null in that case. Each group needs its own pharmacy_name/pharmacy_postcode/pharmacy_address/shift_dates/start_time/end_time. Do NOT create a group per date for a SINGLE pharmacy's rota — that's still just shift_dates on one group (or the top-level fields, if there's only one pharmacy overall).
 hourly_rate, shift_type, break/mileage/pmr_system fields are shared across every group in the same message — a broadcast to multiple branches essentially never varies pay/break/mileage terms per location — so only set those once at the top level, never per-group.
 Fields:
-- intent: "shift_offer" | "cancel_shift" | "show_shifts" | "greeting" | "other" — see above
+- intent: "shift_offer" | "cancel_shift" | "show_shifts" | "analyse_shifts" | "greeting" | "other" — see above
 - already_occurred: boolean | null (only when intent is "shift_offer") — true if the locum is logging a shift they already worked, false/null if it's a future offer/broadcast.
 - dates_explicit_year: boolean | null (only when intent is "shift_offer") — true if the message's date(s) stated an explicit year, false/null for a bare day+month. See above — do not guess a "meant" year yourself, just report whether one was stated.
 - groups: array | null — see above; each entry has pharmacy_name, pharmacy_postcode, pharmacy_address, shift_dates, start_time, end_time, start_asap (same shapes as the top-level fields below). Omit or leave null/empty when the offer is a single pharmacy.
@@ -513,7 +582,7 @@ These three travel fields (mileage_paid+mileage_pence_per_mile / travel_allowanc
       ...history,
       { role: "user", content: text },
     ],
-  });
+  }, { signal: abortContext.getStore() });
   let res;
   try {
     res = await createCompletion(MODEL);
@@ -527,15 +596,72 @@ These three travel fields (mileage_paid+mileage_pence_per_mile / travel_allowanc
   }
   const choice = res.choices[0];
   try {
-    return JSON.parse(choice?.message?.content ?? "{}") as ShiftExtraction;
+    const parsed = shiftExtractionSchema.safeParse(JSON.parse(choice?.message?.content ?? "{}"));
+    if (!parsed.success) {
+      console.error("Shift extraction failed schema validation:", parsed.error.issues.map((issue) => ({ path: issue.path, code: issue.code })));
+      return { intent: "other" };
+    }
+    return parsed.data as ShiftExtraction;
   } catch (err) {
     console.error(
       `Failed to parse shift extraction JSON (finish_reason=${choice?.finish_reason}):`,
       err,
-      choice?.message?.content
+      "response omitted"
     );
     return { intent: "other" };
   }
+}
+
+type ShiftInsights = {
+  summary?: {
+    shift_count: string;
+    first_shift_date: string | null;
+    last_shift_date: string | null;
+    total_paid_hours: string;
+    total_gross_pay: string;
+    average_hourly_rate: string;
+  } | null;
+  pharmacies?: Array<{ pharmacy_name: string; shift_count: string; average_rate: string; gross_pay: string }>;
+  weekdays?: Array<{ weekday: string; shift_count: string; average_rate: string }>;
+  months?: Array<{ month: string; shift_count: string; gross_pay: string; average_rate: string }>;
+  recent?: Array<{ pharmacy_name: string; shift_date: string; start_time: string; end_time: string; hourly_rate: string }>;
+};
+
+async function answerShiftQuestion(userId: string, question: string, history: HistoryTurn[]): Promise<BotReply> {
+  const insights = await botFetch<ShiftInsights>(
+    `/shift-insights?auth_user_id=${encodeURIComponent(userId)}`
+  );
+  if (!Number(insights.summary?.shift_count ?? 0)) {
+    return plain("You don't have any completed shifts in Locum1st yet. Once you've logged some, I can analyse your rates, earnings, pharmacies and working patterns.");
+  }
+
+  const answerSchema = z.object({ answer: z.string().trim().min(1).max(4000) });
+  const createCompletion = (model: string) => client.chat.completions.create({
+    model,
+    response_format: { type: "json_object" },
+    max_completion_tokens: 700,
+    messages: [
+      {
+        role: "system",
+        content: `You are 1stAi, a conversational assistant for a UK locum pharmacist. Answer the user's question using ONLY the supplied Locum1st shift insights. Be warm, direct and useful. Identify genuine patterns, but distinguish facts from tentative patterns when the sample is small. Quote pounds to 2 decimal places where useful. Do not invent causes, forecasts, comparisons, shifts, or statistics. "Gross pay" is estimated from logged paid hours times hourly rate and excludes expenses, tax, mileage and service commission. Mention that caveat when discussing earnings. Never claim to inspect Staff1st, external calendars, messages, or data outside Locum1st. Return JSON: {"answer":"..."}.`,
+      },
+      { role: "system", content: `Locum1st shift insights:\n${JSON.stringify(insights)}` },
+      ...history.slice(-6),
+      { role: "user", content: question },
+    ],
+  }, { signal: abortContext.getStore() });
+
+  let response;
+  try {
+    response = await createCompletion(MODEL);
+  } catch (error) {
+    const apiError = error as { status?: number; code?: string };
+    if (MODEL === FALLBACK_MODEL || apiError.status !== 403 || apiError.code !== "model_not_found") throw error;
+    response = await createCompletion(FALLBACK_MODEL);
+  }
+  const parsed = answerSchema.safeParse(JSON.parse(response.choices[0]?.message?.content ?? "{}"));
+  if (!parsed.success) throw new Error("Shift insight response failed validation");
+  return plain(parsed.data.answer);
 }
 
 // ─── Rate & verdict logic ─────────────────────────────────────────────────────
@@ -1026,7 +1152,7 @@ async function analyzeGroup(
     travel_allowance_fixed: travelAllowance,
   };
   const dates = group.shift_dates;
-  const candidates: PendingShift[] = dates.map((d) => ({ ...template, shift_date: d }));
+  const candidates: PendingShift[] = dates.map((d) => ({ ...template, shift_date: d, proposal_id: crypto.randomUUID() }));
 
   const roleLabel = role ? ROLE_LABELS[role] ?? role : null;
 
@@ -1164,7 +1290,7 @@ async function handleShiftAnalysis(
   for (let i = matches.length; i < groups.length; i++) {
     const group = groups[i]!;
     if (!hasUsableLocation(group)) {
-      setState(conversationId, {
+      await setState(conversationId, userId, {
         phase: "awaiting_postcode",
         ext,
         groups,
@@ -1177,7 +1303,7 @@ async function handleShiftAnalysis(
     }
     const resolution = await resolvePharmacy(conversationId, group);
     if (resolution.status === "ambiguous") {
-      setState(conversationId, {
+      await setState(conversationId, userId, {
         phase: "awaiting_pharmacy_selection",
         ext,
         groups,
@@ -1209,6 +1335,7 @@ async function handleShiftAnalysis(
 
   const analyzed = await Promise.all(groups.map((group, i) => analyzeGroup(conversationId, userId, ext, group, role, matches[i])));
   const candidates = analyzed.flatMap((a) => a.candidates);
+  const conflicts = await Promise.all(candidates.map((candidate) => calendarConflicts(userId, candidate)));
 
   const lines: string[] = [];
   if (groups.length === 1) {
@@ -1225,8 +1352,26 @@ async function handleShiftAnalysis(
     lines.push("", `**Also noted:** ${ext.recurring_availability} — send a specific date when one comes up and I'll analyse it.`);
   }
 
+  const overlapping = conflicts.flatMap((items, index) =>
+    items.map((conflict) => ({ candidate: candidates[index]!, conflict }))
+  );
+  if (overlapping.length) {
+    lines.push("", "**CALENDAR CHECK**");
+    for (const { candidate, conflict } of overlapping) {
+      const datePrefix = candidates.length > 1 ? `${fmtDateWeekdayShort(candidate.shift_date)} — ` : "";
+      lines.push(`${datePrefix}${conflictLine(conflict)}`);
+    }
+    lines.push("", "Any overlapping shift cannot be logged until the clash is resolved.");
+  } else {
+    lines.push("", "**Calendar:** No overlapping shifts are booked in Locum1st.");
+  }
+
   if (candidates.length === 1) {
-    setState(conversationId, {
+    if (overlapping.length) {
+      await setState(conversationId, userId, { phase: "idle" });
+      return plain(lines.join("\n"));
+    }
+    await setState(conversationId, userId, {
       phase: "awaiting_confirmation",
       pending: candidates[0]!,
       rateRequired: ext.rate_negotiable === true && ext.hourly_rate == null,
@@ -1234,7 +1379,7 @@ async function handleShiftAnalysis(
     return confirmShift(lines.join("\n"));
   }
 
-  setState(conversationId, {
+  await setState(conversationId, userId, {
     phase: "awaiting_date_selection",
     candidates,
     rateRequired: ext.rate_negotiable === true && ext.hourly_rate == null,
@@ -1242,7 +1387,7 @@ async function handleShiftAnalysis(
   lines.push("");
   lines.push("**WHICH SHIFTS DO YOU WANT TO LOG?**");
   candidates.forEach((c, i) =>
-    lines.push(`${i + 1}. ${c.pharmacy_name} — ${fmtDateWeekdayShort(c.shift_date)}, ${c.start_time}–${c.end_time}`)
+    lines.push(`${i + 1}. ${c.pharmacy_name} — ${fmtDateWeekdayShort(c.shift_date)}, ${c.start_time}–${c.end_time}${conflicts[i]?.length ? " — ⚠ OVERLAPS" : ""}`)
   );
   lines.push("");
   lines.push('Reply with the numbers you want (e.g. "1,3"), "all" to log every shift, or "none" to skip.');
@@ -1253,17 +1398,32 @@ async function handleShiftAnalysis(
 }
 
 async function handleSaveShift(conversationId: string, userId: string, pending: PendingShift): Promise<BotReply> {
-  const result = await botFetch<{
+  const workflow = await loadWorkflow<State>(conversationId, userId, { phase: "idle" });
+  if (!workflow.workflowId || workflow.expired) {
+    return plain("That request expired, so the shift was not logged. Please send the shift offer again.");
+  }
+  let result: {
     ok?: boolean;
     mileage_miles?: number | null;
     mileage_manual_needed?: boolean;
     error?: string;
-  }>("/save-shift", {
-    method: "POST",
-    body: JSON.stringify({ auth_user_id: userId, pending_shift: pending }),
-  });
-
-  setState(conversationId, { phase: "idle" });
+  };
+  try {
+    result = await botFetch<typeof result>("/save-shift", {
+      method: "POST",
+      body: JSON.stringify({
+        auth_user_id: userId,
+        pending_shift: pending,
+        ...shiftSaveIdentity(workflow.workflowId, pending.proposal_id),
+      }),
+    });
+  } catch (error) {
+    const data = error instanceof BotApiError ? error.data as { error?: string; conflicts?: CalendarConflict[] } : null;
+    if (data?.error === "calendar_conflict" && data.conflicts?.length) {
+      return plain(["**Shift not logged — calendar overlap found.**", "", ...data.conflicts.map(conflictLine), "", "Resolve the clash first, then try again."].join("\n"));
+    }
+    throw error;
+  }
 
   if (result.error === "no_pending_shift") return plain("Session expired. Please send the shift message again.");
   if (!result.ok) return plain("Failed to log the shift. Please try again or add it manually at locum1st.net/shifts");
@@ -1282,7 +1442,7 @@ async function handleSaveShift(conversationId: string, userId: string, pending: 
   else if (result.mileage_manual_needed) lines.push("", "Add mileage manually at locum1st.net/mileage");
   if (pending.travel_allowance_fixed) lines.push("", `**Travel allowance:** £${pending.travel_allowance_fixed} fixed.`);
   lines.push("", "View at locum1st.net/shifts");
-  return plain(lines.join("\n"));
+  return { text: lines.join("\n"), workflowStatus: "completed" };
 }
 
 // Logs a flat list of already-resolved shift candidates — one /save-shift
@@ -1296,11 +1456,20 @@ async function handleSaveShifts(
   userId: string,
   candidates: PendingShift[]
 ): Promise<BotReply> {
-  setState(conversationId, { phase: "idle" });
-
   if (!candidates.length) return plain("No shifts selected. Send another shift offer whenever you're ready.");
 
-  const results: Array<{ candidate: PendingShift; ok: boolean; mileage_miles?: number | null; mileage_manual_needed?: boolean }> = [];
+  const workflow = await loadWorkflow<State>(conversationId, userId, { phase: "idle" });
+  if (!workflow.workflowId || workflow.expired) {
+    return plain("That request expired, so no shifts were logged. Please send the shift offer again.");
+  }
+
+  const results: Array<{
+    candidate: PendingShift;
+    ok: boolean;
+    mileage_miles?: number | null;
+    mileage_manual_needed?: boolean;
+    conflicts?: CalendarConflict[];
+  }> = [];
   for (const candidate of candidates) {
     try {
       const result = await botFetch<{
@@ -1309,12 +1478,19 @@ async function handleSaveShifts(
         mileage_manual_needed?: boolean;
       }>("/save-shift", {
         method: "POST",
-        body: JSON.stringify({ auth_user_id: userId, pending_shift: candidate }),
+        body: JSON.stringify({
+          auth_user_id: userId,
+          pending_shift: candidate,
+          ...shiftSaveIdentity(workflow.workflowId, candidate.proposal_id),
+        }),
       });
       results.push({ candidate, ok: !!result.ok, mileage_miles: result.mileage_miles, mileage_manual_needed: result.mileage_manual_needed });
     } catch (err) {
-      console.error(`[${conversationId}] Failed to save shift for ${candidate.shift_date} at ${candidate.pharmacy_name}:`, err);
-      results.push({ candidate, ok: false });
+      const data = err instanceof BotApiError ? err.data as { error?: string; conflicts?: CalendarConflict[] } : null;
+      if (data?.error !== "calendar_conflict") {
+        console.error(`[${conversationId}] Failed to save shift proposal ${candidate.proposal_id}:`, err);
+      }
+      results.push({ candidate, ok: false, conflicts: data?.conflicts });
     }
   }
 
@@ -1322,6 +1498,10 @@ async function handleSaveShifts(
   const failed = results.filter((r) => !r.ok);
 
   if (!succeeded.length) {
+    const overlaps = failed.flatMap((result) => result.conflicts ?? []);
+    if (overlaps.length) {
+      return plain(["**No shifts logged — calendar overlaps found.**", "", ...overlaps.map(conflictLine), "", "Resolve the clashes first, then try again."].join("\n"));
+    }
     return plain("Failed to log those shifts. Please try again or add them manually at locum1st.net/shifts");
   }
 
@@ -1358,9 +1538,11 @@ async function handleSaveShifts(
       "",
       `Couldn't log ${failed.length} of them (${failed.map((f) => `${f.candidate.pharmacy_name} ${fmtDateShort(f.candidate.shift_date)}`).join(", ")}) — try again or add manually.`
     );
+    const overlaps = failed.flatMap((result) => result.conflicts ?? []);
+    if (overlaps.length) lines.push(...overlaps.map(conflictLine));
   }
   lines.push("", "View at locum1st.net/shifts");
-  return plain(lines.join("\n"));
+  return { text: lines.join("\n"), workflowStatus: failed.length ? undefined : "completed" };
 }
 
 async function handleAcceptedCandidates(
@@ -1370,7 +1552,7 @@ async function handleAcceptedCandidates(
   rateRequired: boolean
 ): Promise<BotReply> {
   if (rateRequired) {
-    setState(conversationId, { phase: "awaiting_rate", candidates });
+    await setState(conversationId, userId, { phase: "awaiting_rate", candidates });
     return plain(`What £/hr rate did you agree with the pharmacy? For example, reply "£32". (Or reply "cancel" to skip logging.)`);
   }
   return candidates.length === 1
@@ -1385,7 +1567,7 @@ async function handleListShiftsForDelete(conversationId: string, userId: string)
 
   if (!data.shifts?.length) return plain("You have no upcoming shifts logged.");
 
-  setState(conversationId, { phase: "awaiting_delete", shifts: data.shifts });
+  await setState(conversationId, userId, { phase: "awaiting_delete", shifts: data.shifts });
 
   const list = data.shifts
     .map((s, i) => `${i + 1}. **${s.pharmacy_name}** — ${fmtDateShort(s.shift_date)}, ${s.start_time}–${s.end_time}`)
@@ -1401,7 +1583,7 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
     body: JSON.stringify({ auth_user_id: userId, shift_id: shift.id }),
   });
 
-  setState(conversationId, { phase: "idle" });
+  await setState(conversationId, userId, { phase: "idle" });
 
   if (!result.ok) return plain("Failed to delete that shift. Try again or remove it manually at locum1st.net/shifts");
 
@@ -1417,14 +1599,19 @@ async function handleDeleteShift(conversationId: string, userId: string, shift: 
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
-export async function processMessage(
+async function processMessageInternal(
   conversationId: string,
   userId: string,
   text: string,
   messageId: string
 ): Promise<BotReply> {
-  const state = getState(conversationId);
+  const workflow = await loadWorkflow<State>(conversationId, userId, { phase: "idle" });
+  const state = workflow.state;
   const trimmed = text.trim();
+
+  if (workflow.expired && looksLikeExpiredActionReply(trimmed)) {
+    return plain("That request expired after 10 minutes, so nothing was changed. Please send the shift offer again.");
+  }
 
   // ── Awaiting YES/NO ──────────────────────────────────────────────────────
   if (state.phase === "awaiting_confirmation") {
@@ -1432,10 +1619,10 @@ export async function processMessage(
       return handleAcceptedCandidates(conversationId, userId, [state.pending], state.rateRequired === true);
     }
     if (/^(no|n|decline|skip|nope|cancel|pass)\b/i.test(trimmed)) {
-      setState(conversationId, { phase: "idle" });
+      await setState(conversationId, userId, { phase: "idle" });
       return plain("Shift declined. Send another shift offer whenever you're ready.");
     }
-    setState(conversationId, { phase: "idle" });
+    await setState(conversationId, userId, { phase: "idle" });
   }
 
   // ── Awaiting delete selection ────────────────────────────────────────────
@@ -1447,14 +1634,14 @@ export async function processMessage(
     if (/^\d+$/.test(trimmed)) {
       return plain(`That number isn't in the list. Reply with a number from 1 to ${state.shifts.length}.`);
     }
-    setState(conversationId, { phase: "idle" });
+    await setState(conversationId, userId, { phase: "idle" });
   }
 
   // ── Awaiting date selection (multi-shift offer) ──────────────────────────
   if (state.phase === "awaiting_date_selection") {
     const lower = trimmed.toLowerCase();
     if (/^(none|cancel|skip)\b/.test(lower)) {
-      setState(conversationId, { phase: "idle" });
+      await setState(conversationId, userId, { phase: "idle" });
       return plain("No shifts logged. Send another shift offer whenever you're ready.");
     }
     if (/^all\b/.test(lower)) {
@@ -1472,7 +1659,7 @@ export async function processMessage(
     if (looksLikeFailedSelection(trimmed)) {
       return plain(`I couldn't match that to the list. Reply with numbers from 1 to ${state.candidates.length} (e.g. "1,3"), "all", or "none".`);
     }
-    setState(conversationId, { phase: "idle" });
+    await setState(conversationId, userId, { phase: "idle" });
   }
 
   // ── Awaiting pharmacy selection (ambiguous postcode match) ───────────────
@@ -1491,13 +1678,13 @@ export async function processMessage(
     if (/^\d+$/.test(trimmed)) {
       return plain(`That number isn't in the list. Reply with a number from 1 to ${state.candidates.length}, or "none".`);
     }
-    setState(conversationId, { phase: "idle" });
+    await setState(conversationId, userId, { phase: "idle" });
   }
 
   // ── Awaiting a postcode (pharmacy not found, message gave no location) ──
   if (state.phase === "awaiting_postcode") {
     if (/^(cancel|none)\b/i.test(trimmed)) {
-      setState(conversationId, { phase: "idle" });
+      await setState(conversationId, userId, { phase: "idle" });
       return plain("Shift not analysed or logged because the pharmacy location couldn't be verified.");
     }
     const postcode = normalizedPostcode(trimmed);
@@ -1513,7 +1700,7 @@ export async function processMessage(
   // ── Awaiting the agreed rate after the user chose to log ────────────────
   if (state.phase === "awaiting_rate") {
     if (/^(cancel|skip|none|not sure|tbc|don'?t know)\b/i.test(trimmed)) {
-      setState(conversationId, { phase: "idle" });
+      await setState(conversationId, userId, { phase: "idle" });
       return plain("Shift not logged. Send another shift offer whenever you're ready.");
     }
     const stated = parseStatedRate(trimmed);
@@ -1551,12 +1738,16 @@ export async function processMessage(
       .join("\n"));
   }
 
+  if (ext.intent === "analyse_shifts") {
+    return answerShiftQuestion(userId, text, history);
+  }
+
   if (ext.intent === "greeting") {
-    return plain("Send me a shift offer and I'll analyse it:\n\n**Rate** vs workload\n**Driving distance** from your home\n**Verdict** on whether the pay is fair\n\nThen log it to your shifts if you want to accept it.");
+    return plain("Hi! I can help you naturally — you don't need to paste a structured message.\n\nTell me about a shift in your own words and I'll ask for anything missing before you confirm it. You can also ask things like:\n\n- **What's my average hourly rate?**\n- **Which pharmacy do I work at most?**\n- **What patterns can you see in my previous shifts?**\n- **What shifts have I got coming up?**");
   }
 
   if (ext.intent !== "shift_offer") {
-    return plain("I'm here to analyse shifts and log them. Forward a shift offer to get started.");
+    return plain("I can help with your Locum1st shifts. Tell me about a shift conversationally, ask about your previous work patterns or earnings, or ask what you have booked. What would you like to look at?");
   }
 
   const groups = normalizeGroups(ext);
@@ -1591,4 +1782,16 @@ export async function processMessage(
       groups.map((g) => `${g.pharmacy_name ?? "?"} ${g.shift_dates.join(",")} ${g.start_time}-${g.end_time}`).join(" | ")
   );
   return handleShiftAnalysis(conversationId, userId, ext, groups, role);
+}
+
+export async function processMessage(
+  conversationId: string,
+  userId: string,
+  text: string,
+  messageId: string,
+  signal?: AbortSignal
+): Promise<BotReply> {
+  return signal
+    ? abortContext.run(signal, () => processMessageInternal(conversationId, userId, text, messageId))
+    : processMessageInternal(conversationId, userId, text, messageId);
 }
