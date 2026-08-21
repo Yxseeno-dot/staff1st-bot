@@ -71,6 +71,7 @@ async function claimMessages(limit: number): Promise<UnprocessedMessage[]> {
              SELECT 1 FROM locum1st.messages earlier
              WHERE earlier.conversation_id = m.conversation_id
                AND earlier.bot_processed = false
+               AND earlier.sender_id <> $1
                AND (earlier.created_at, earlier.id) < (m.created_at, m.id)
            )
          ORDER BY m.created_at, m.id

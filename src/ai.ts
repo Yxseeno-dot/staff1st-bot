@@ -340,7 +340,7 @@ const shiftExtractionSchema = z.object({
   intent: z.enum(["shift_offer", "cancel_shift", "show_shifts", "analyse_shifts", "greeting", "other"]),
   already_occurred: nullableBoolean,
   dates_explicit_year: nullableBoolean,
-  groups: z.array(shiftGroupSchema).max(50).optional(),
+  groups: z.array(shiftGroupSchema).max(50).nullish().transform((value) => value ?? undefined),
   pharmacy_name: optionalStringFromNull,
   pharmacy_postcode: optionalStringFromNull,
   pharmacy_address: optionalStringFromNull,
